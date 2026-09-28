@@ -1,0 +1,80 @@
+[project]
+name = "notion-email-agent"
+version = "0.1.0"
+description = "Notion deadline reminder agent — MVP (build phases 1-3), no LLM in the flow"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # Web + scheduling
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.32,<1.0",
+    "apscheduler>=3.10,<4.0",          # 3.x AsyncIOScheduler; 4.x is an incompatible rewrite
+    # Persistence
+    "sqlalchemy[asyncio]>=2.0.36,<2.1",
+    "alembic>=1.14,<2.0",
+    "psycopg[binary]>=3.2,<4.0",
+    # Config + validation
+    "pydantic>=2.9,<3.0",
+    "pydantic-settings>=2.6,<3.0",
+    # Resilience + logging
+    "tenacity>=9.0,<10.0",
+    "structlog>=24.4,<26.0",
+    "httpx>=0.27,<1.0",                # Notion REST, behind the NotionClient port
+    # Windows has no system tz database, so zoneinfo relies on this package.
+    # Pinned explicitly: every due time, reminder target, and date phrase depends on it.
+    "tzdata>=2024.1",
+    # Gmail. PRESENT because phase 3 needs the real send()/find_sent_by_token().
+    # MUST NOT be exercised by any test (CLAUDE.md constraint 5).
+    "google-api-python-client>=2.149,<3.0",
+    "google-auth>=2.36,<3.0",
+    "google-auth-oauthlib>=1.2,<2.0",  # only for the one-time `python -m app.cli gmail-auth`
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9.0",
+    "pytest-asyncio>=0.24,<1.0",
+    "ruff>=0.8,<1.0",
+    "mypy>=1.13,<2.0",
+    "time-machine>=2.16,<3.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "ASYNC", "T20"]
+ignore = ["RUF001", "RUF002"]  # typographic punctuation in docstrings is fine
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["T20"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/app", "tests"]
+# Two `conftest.py` files with no `__init__.py` anywhere under `tests/` are the same
+# module name to mypy. Explicit package bases derive each module's name from its path
+# instead, and `tests` on the path is what lets `from fixtures... import ...` resolve.
+mypy_path = ["src", "tests"]
+explicit_package_bases = true
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["google.*", "googleapiclient.*", "google_auth_oauthlib.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "integration: needs a reachable Postgres",
+    "e2e: frozen-clock dry run",
+]

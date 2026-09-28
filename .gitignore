@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── Project-specific ─────────────────────────────────────────────────────────
+# `.env` alone is covered by the Environments section above; this also excludes
+# `.env.local` and friends while keeping the tracked template. `!.env.example` has to
+# come after `.env.*` or the re-include is overridden by the later pattern.
+.env.*
+!.env.example
+
+# Editor and OS
+.idea/
+.vscode/
+.DS_Store

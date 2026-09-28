@@ -1,0 +1,48 @@
+# Local development and integration-test PostgreSQL 16.
+#
+# CLAUDE.md constraint 1: this is the ONLY database a dev or test run may use. Never point
+# `DATABASE_URL` or `TEST_DATABASE_URL` at the Railway/production instance from a machine
+# running this app — it writes to real Notion databases and sends real email.
+#
+#   docker compose up -d db          # start
+#   docker compose down              # stop (keeps the volume)
+#   docker compose down -v           # stop and delete the data
+#
+# Two databases live in this one server:
+#   notion_agent_dev   created by POSTGRES_DB below
+#   notion_agent_test  used by the integration suite (TEST_DATABASE_URL)
+#
+# The second one is created once after the first start (the official image's
+# /docker-entrypoint-initdb.d hook needs a script file, and a manual step is honest about
+# what is happening). Idempotent, so re-running it is harmless:
+#
+#   docker compose exec db createdb -U postgres notion_agent_test
+#
+# Both databases use user/password postgres/postgres, matching the CI service container
+# (.github/workflows/ci.yml).
+
+services:
+  db:
+    image: postgres:16
+    container_name: notion-agent-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: notion_agent_dev
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      # 5432:5432, bound to loopback so only this machine can reach it.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # `docker compose up --wait` and the integration suite both key off this.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d notion_agent_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  postgres_data:
+    name: notion-agent-postgres-data
