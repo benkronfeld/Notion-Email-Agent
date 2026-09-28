@@ -41,7 +41,14 @@ def make_settings(**overrides: Any) -> Settings:
 
 class TestRequiredValues:
     @pytest.mark.parametrize("missing", sorted(REQUIRED))
-    def test_each_required_value_is_actually_required(self, missing: str) -> None:
+    def test_each_required_value_is_actually_required(
+        self, missing: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Remove the field's environment variable first, or this asserts nothing: pydantic
+        # -settings falls back to `os.environ`, and CI exports `DATABASE_URL` for the
+        # Postgres service container. Omitting the keyword there still validated, so the
+        # test passed locally (where the variable is unset) and failed only in CI.
+        monkeypatch.delenv(missing.upper(), raising=False)
         values: dict[str, Any] = {k: v for k, v in REQUIRED.items() if k != missing}
         with pytest.raises(ValidationError):
             Settings(_env_file=None, **values)
