@@ -11,10 +11,15 @@ It is safe to run any number of times: the unique constraint
 produces no actions at all. Option A (a new due date gets a fresh schedule) falls out for
 free, because a new due date is simply a new key.
 
-The algorithm follows §2.3.2.B literally. Two consequences are deliberate and documented
-in the tests: a `skipped(item_completed|item_inactive)` row whose target is still in the
-future is resurrected, and a `superseded` row is not. See `test_planner.py` for the
-reverted-due-date case, which is the one place this reads oddly.
+The algorithm follows §2.3.2.B, with one deliberate addition to step 2 that the spec's
+prose omits (and that §2.3.2.B's "known gap" note asked to be closed): a `superseded` row
+also goes back to `pending` when its due date returns. Without it, moving a due date away
+and then back leaves the original rows holding the unique key and the restored date with
+no reminder at all — a silently lost reminder, the one outcome CLAUDE.md constraint 7
+exists to prevent. Two states can therefore be revived, and both are pinned by tests: a
+`skipped(item_completed|item_inactive)` row whose item became active and incomplete again,
+and a `superseded` row whose own date came back. Everything a `sent` row records, and
+every `missed_window`, stays exactly where it is.
 """
 
 from __future__ import annotations
@@ -39,6 +44,10 @@ IN_FLIGHT: frozenset[str] = frozenset({"pending", "claimed"})
 # Resurrectable skip reasons. A row skipped because the item was complete or inactive is
 # revived when the item becomes active and incomplete again (§2.3.2.B step 2). A
 # `missed_window` skip is NOT revived — the window is gone for good (FR-4).
+#
+# These are reasons a *skipped* row can be revived for. A `superseded` row carries no
+# reason at all (`skip_reason IS NULL`), so it cannot be expressed here; `_is_revivable`
+# is where both cases are decided.
 RESURRECTABLE_SKIPS: frozenset[str] = frozenset({"item_completed", "item_inactive"})
 
 
@@ -60,8 +69,10 @@ class PlannerPolicy:
 class MarkSuperseded:
     """An in-flight reminder whose due date moved. Replaced by a fresh schedule.
 
-    Only ever a due-date change (FR-8, Option A). A superseded row is deliberately NOT
-    revivable, which is what keeps sent history and old schedules distinct.
+    Only ever a due-date change (FR-8, Option A). A `sent` row is never superseded and
+    never revived, so sent history and old schedules stay distinct — but a superseded row
+    whose date later comes back *is* revived by step 2, because otherwise the restored
+    date would silently get no reminder at all.
     """
 
     reminder_id: UUID
@@ -81,7 +92,12 @@ class MarkSkipped:
 
 @dataclass(frozen=True, slots=True)
 class FlipToPending:
-    """A previously skipped reminder that applies again — the symmetric transition."""
+    """A previously skipped or superseded reminder that applies again.
+
+    Two ways in, and both are reversals of a state this planner itself wrote: un-completing
+    or un-archiving the item reverses `skipped`, and a due date returning reverses
+    `superseded`. See `_is_revivable`.
+    """
 
     reminder_id: UUID
 
@@ -142,11 +158,13 @@ def plan_reminders(
 
     # Step 1 — cancel anything still in flight that no longer applies.
     #
-    # The three cases produce two DIFFERENT states, and the distinction is load-bearing:
-    #   * item inactive / complete -> `skipped(reason)`, which step 2 can revive
-    #   * the due date moved       -> `superseded`, which step 2 never revives
+    # The three cases produce two DIFFERENT states, and the distinction is still worth
+    # keeping even though step 2 can revive both:
+    #   * item inactive / complete -> `skipped(reason)`, revivable when the item comes back
+    #   * the due date moved       -> `superseded`, revivable when *this* date comes back
     # Collapsing them into `superseded` would silently break the symmetric transition:
-    # un-completing an item could never bring a still-future reminder back.
+    # un-completing an item could never bring a still-future reminder back, because the
+    # flip would be gated on a due date that never moved.
     # A completed or deactivated item wins over a due-date change, so its reason is
     # reported as completion rather than as a moved date.
     for row in existing:
@@ -183,8 +201,7 @@ def plan_reminders(
                     )
                 )
             elif (
-                stored.status == "skipped"
-                and stored.skip_reason in RESURRECTABLE_SKIPS
+                _is_revivable(stored)
                 and target.target_at > now
                 and item.is_active
                 and not is_complete
@@ -194,3 +211,29 @@ def plan_reminders(
             # missed. The unique key makes re-inserting impossible anyway.
 
     return actions
+
+
+def _is_revivable(stored: PlannerReminder) -> bool:
+    """Whether a stored row that is not already `pending` should go back to `pending`.
+
+    Two states qualify, for different reasons — and only ever for the *desired* due date,
+    because the caller looks a row up by `(reminder_type, due_at_snapshot)` and so can only
+    reach one whose snapshot is the date the item has right now:
+
+    * ``skipped(item_completed | item_inactive)`` — the *item* changed, not the date. Step
+      2's symmetric transition (§2.3.2.B): un-completing or un-archiving an item revives a
+      still-future reminder. `RESURRECTABLE_SKIPS` is the closed list.
+    * ``superseded`` — the *date* changed and came back (FR-8 Option A). The row still
+      occupies the unique key for the restored date, so without this it would sit there
+      forever and the restored date would receive no reminder: a silently lost reminder,
+      which CLAUDE.md constraint 7 forbids outright. This is the addition to step 2 the
+      spec's prose does not spell out.
+
+    A `sent` row is never revivable, so sent history and old schedules stay distinct. A
+    `missed_window` skip is never revivable either: the window is gone for good (FR-4). The
+    caller separately requires `target_at > now` and an active, incomplete item, so this
+    predicate only has to answer "is this state a reversal of one we wrote?".
+    """
+    if stored.status == "superseded":
+        return True
+    return stored.status == "skipped" and stored.skip_reason in RESURRECTABLE_SKIPS

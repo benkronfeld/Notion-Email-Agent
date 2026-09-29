@@ -181,13 +181,30 @@ async def test_cancel_unknown_reminder_is_404(
     assert response.status_code == 404
 
 
-# ── The V1 endpoint that must not exist ─────────────────────────────────────
+# ── The V1 endpoint (build phase 4) ─────────────────────────────────────────
 
 
-async def test_gmail_poll_is_404(client: httpx.AsyncClient, admin_headers: dict[str, str]) -> None:
-    """Inbound polling is V1 (build phase 4). The route must 404, token or no token."""
-    assert (await client.post("/admin/gmail/poll", headers=admin_headers)).status_code == 404
-    assert (await client.post("/admin/gmail/poll")).status_code == 404
+async def test_gmail_poll_requires_the_admin_token(
+    client: httpx.AsyncClient, admin_headers: dict[str, str]
+) -> None:
+    """Inbound polling exists now, and it is behind the admin token like every other route.
+
+    This was `test_gmail_poll_is_404` while inbound handling was unbuilt. It is worth
+    keeping in its new form rather than deleting: the poll can reach Notion through the
+    reply pipeline, so "is this route authenticated?" is a question that should keep being
+    asked by a test rather than by memory.
+    """
+    assert (await client.post("/admin/gmail/poll")).status_code == 401
+    assert (await client.post("/admin/gmail/poll", headers=admin_headers)).status_code == 200
+
+
+async def test_gmail_poll_runs_the_poller_job(
+    client: httpx.AsyncClient, admin_headers: dict[str, str]
+) -> None:
+    """It returns the `gmail_poller` job result, and reports whether it ran."""
+    response = await client.post("/admin/gmail/poll", headers=admin_headers)
+    assert response.status_code == 200
+    assert response.json() == {"job": "gmail_poller", "ran": True}
 
 
 # ── Fixture-level row builders ──────────────────────────────────────────────

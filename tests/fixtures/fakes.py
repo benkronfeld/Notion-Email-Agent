@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -23,10 +23,22 @@ from app.clock import Clock
 from app.config import Settings
 from app.container import AppContainer
 from app.db.session import create_engine, create_session_factory
-from app.domain.types import Intent, InterpretationContext, NotionPage, PollResult, SentMessage
+from app.domain.intents import Intent
+from app.domain.types import (
+    InboundMessage,
+    InterpretationContext,
+    NotionPage,
+    PollResult,
+    SentMessage,
+)
 from app.integrations.gmail.client import MailClient
 from app.integrations.llm.interpreter import IntentInterpreter
-from app.integrations.notion.client import NotionClient
+from app.integrations.notion.client import (
+    NotionClient,
+    NotionError,
+    NotionNotFoundError,
+    NotionTransientError,
+)
 
 # Default `database_id -> data_source_id` map, matching `tests/fixtures/pages.py`'s default
 # `DEFAULT_DATA_SOURCE_ID` ("ds-1"). Real resolution is a `GET /v1/databases/{id}` call; the
@@ -37,7 +49,7 @@ DEFAULT_DATA_SOURCE_IDS: Mapping[str, str] = {
 }
 
 
-class FakeNotionUnreachable(RuntimeError):
+class FakeNotionUnreachable(NotionError):
     """Notion could not be reached. Raised by `FakeNotionClient(raise_on_get_page=True)`.
 
     Models the pre-send check when Notion is down: the scheduler must proceed on local
@@ -47,6 +59,29 @@ class FakeNotionUnreachable(RuntimeError):
 
 class FakeMailError(RuntimeError):
     """A simulated Gmail send failure, for the backoff / 5-strike path (§2.3.2.C)."""
+
+
+class FakeNotionNotFound(NotionNotFoundError):
+    """The page is gone (HTTP 404).
+
+    It subclasses the adapter's real `NotionNotFoundError` rather than being a bare
+    `RuntimeError`. That is load-bearing, not tidiness: the writer's rules are keyed on the
+    real error types — a 404 is terminal and must never be retried, a transient error is
+    retried once — so a fake whose errors were unrelated types could not exercise either
+    rule, and a test asserting "no retry on 404" would pass for the wrong reason.
+
+    The writer must treat this as an honest failure — "the change was NOT made" — never as
+    a success claim (§2.3.4, Appendix B case 6).
+    """
+
+
+class FakeNotionTransient(NotionTransientError):
+    """A retryable Notion failure (HTTP 429/5xx).
+
+    Distinct from `FakeNotionUnreachable` on purpose: a *transient* error is what the
+    writer's one-retry-then-re-verify path is for, while an unreachable Notion is what the
+    scheduler's pre-send check tolerates.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,12 +123,20 @@ class FakeNotionClient:
         *,
         data_source_ids: Mapping[str, str] | None = None,
         raise_on_get_page: bool = False,
+        fail_update_times: int = 0,
+        drop_update: bool = False,
     ) -> None:
         self.pages: list[NotionPage] = list(pages)
         self.data_source_ids: dict[str, str] = dict(data_source_ids or DEFAULT_DATA_SOURCE_IDS)
         # Mutable on purpose: a test flips this mid-test to simulate Notion going down
         # between the claim and the pre-send check.
         self.raise_on_get_page = raise_on_get_page
+        # `fail_update_times=1` raises once then succeeds: the writer's single retry on a
+        # transient 429/5xx. `drop_update=True` accepts the PATCH and *does not apply it*,
+        # which is how "the write appeared to succeed but read-back disagrees" (§2.3.4,
+        # Appendix B case 13) is tested — the one failure mode a read-back exists to catch.
+        self.fail_update_times = fail_update_times
+        self.drop_update = drop_update
         self.resolve_calls: list[str] = []
         self.list_changed_calls: list[ChangedPagesCall] = []
         self.list_all_calls: list[str] = []
@@ -166,7 +209,16 @@ class FakeNotionClient:
         due_property: str,
         due_date: date | None,
     ) -> None:
-        """V1 (build phase 6). The MVP must never write to Notion, so this always raises."""
+        """Apply one write to the stored page (V1, build phase 6).
+
+        **It really mutates the page.** That is the point: the writer's read-back step only
+        proves something if the fake can disagree with it, so `get_page` afterwards returns
+        exactly what a real Notion would — including nothing at all when `drop_update` is set.
+
+        `None` means "this property was not part of the change", matching the port's
+        contract (§2.3.6): the writer passes only what actually changed, so a `None` here is
+        left untouched rather than cleared.
+        """
         self.update_page_calls.append(
             UpdatePageCall(
                 page_id=page_id,
@@ -178,9 +230,31 @@ class FakeNotionClient:
                 due_date=due_date,
             )
         )
-        raise NotImplementedError(
-            "FakeNotionClient.update_page is V1 (build phase 6); the MVP never writes to Notion"
-        )
+
+        if self.fail_update_times > 0:
+            self.fail_update_times -= 1
+            raise FakeNotionTransient(f"simulated: PATCH /v1/pages/{page_id} returned 503")
+
+        page = next((candidate for candidate in self.pages if candidate.page_id == page_id), None)
+        if page is None:
+            raise FakeNotionNotFound(f"simulated: page {page_id} not found")
+
+        if self.drop_update:
+            # The write is accepted and silently does nothing — the "read-back disagrees"
+            # case (§2.3.4, Appendix B case 13).
+            return
+
+        properties: dict[str, object] = dict(page.properties)
+        if status_name is not None:
+            properties[status_property] = {"type": "status", "status": {"name": status_name}}
+        if done_property is not None and done_value is not None:
+            properties[done_property] = {"type": "checkbox", "checkbox": done_value}
+        if due_date is not None:
+            properties[due_property] = {
+                "type": "date",
+                "date": {"start": due_date.isoformat()},
+            }
+        self.add(replace(page, properties=properties))
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,7 +271,13 @@ class SendCall:
 class FakeMailClient:
     """In-memory `MailClient`. Nothing is ever sent over a network."""
 
-    def __init__(self, *, fail_times: int = 0, fail_always: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_times: int = 0,
+        fail_always: bool = False,
+        poll_error: Exception | None = None,
+    ) -> None:
         # `fail_times=2` fails the first two attempts then succeeds: the retry/backoff path.
         # `fail_always=True` drives the 5-strike -> failed + alert path (§2.3.2.C).
         self.fail_times = fail_times
@@ -205,6 +285,14 @@ class FakeMailClient:
         self.send_attempts = 0
         self.sent: list[SendCall] = []
         self.messages: list[SentMessage] = []
+        # Inbound (V1). `receive` queues a message for the next poll; a poll drains the
+        # queue, so a second poll with nothing new queued returns no messages — which is
+        # what makes "the same reply is not processed twice" testable at the service level
+        # as well as at the dedupe level.
+        self.inbox: list[InboundMessage] = []
+        self.poll_calls: list[str | None] = []
+        # Set to model a Gmail poll failure (auth expired, history 404 with no fallback).
+        self.poll_error = poll_error
 
     async def send(
         self,
@@ -233,11 +321,24 @@ class FakeMailClient:
         self.messages.append(message)
         return message
 
+    def receive(self, message: InboundMessage) -> None:
+        """Queue one inbound message for the next poll (V1, build phase 4)."""
+        self.inbox.append(message)
+
     async def poll_new(self, history_id: str | None) -> PollResult:
-        """V1 (build phase 4). The MVP has no inbound poll."""
-        raise NotImplementedError(
-            "FakeMailClient.poll_new is V1 (build phase 4); the MVP never polls Gmail"
-        )
+        """Drain the inbox and advance the cursor (V1, build phase 4).
+
+        The returned `history_id` always moves forward, including on an empty poll, because
+        that is what the real API does and because a pipeline that only stored the cursor
+        when it found something would rescan the same window forever.
+        """
+        self.poll_calls.append(history_id)
+        if self.poll_error is not None:
+            raise self.poll_error
+
+        messages = tuple(self.inbox)
+        self.inbox.clear()
+        return PollResult(messages=messages, history_id=f"fake-history-{len(self.poll_calls)}")
 
     async def find_sent_by_token(self, token: str) -> SentMessage | None:
         """The stale-claim recovery lookup (§2.3.2.C): "did the email actually go out?".
@@ -253,19 +354,44 @@ class FakeMailClient:
 
 
 class FakeIntentInterpreter:
-    """The MVP has no LLM anywhere in the flow. Reaching this is a bug, so it raises.
+    """A scripted interpreter (V1, build phase 5) that still refuses to be called unscripted.
 
-    A silent no-op here would let an LLM call slip into the reminder path unnoticed; the
-    `raise` is the guard (§1.2 non-goals, CLAUDE.md "no LLM call anywhere in the MVP").
+    Script it with the intents a test wants returned, in order::
+
+        FakeIntentInterpreter([Intent(action=IntentAction.CHANGE_STATUS, status="Completed")])
+
+    An **unscripted** fake raises, exactly as it did in the MVP. That guard is worth keeping:
+    the reminder flow must never reach an LLM, so an MVP-path test that accidentally wires a
+    real interpretation in still fails loudly rather than silently succeeding. A V1 test
+    always scripts what it expects, so the raise is never hit by accident.
+
+    `default` is for tests that make several calls and only care that *something* coherent
+    comes back; `error` models a DeepSeek outage.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        intents: Iterable[Intent] | None = None,
+        *,
+        default: Intent | None = None,
+        error: Exception | None = None,
+    ) -> None:
         self.calls: list[InterpretationContext] = []
+        self.intents: list[Intent] = list(intents or ())
+        self.default = default
+        self.error = error
 
     async def interpret(self, ctx: InterpretationContext) -> Intent:
         self.calls.append(ctx)
+        if self.error is not None:
+            raise self.error
+        if self.intents:
+            return self.intents.pop(0)
+        if self.default is not None:
+            return self.default
         raise NotImplementedError(
-            "FakeIntentInterpreter.interpret: the MVP makes no LLM call (V1, build phase 5)"
+            "FakeIntentInterpreter.interpret was called with no scripted intent. Script it "
+            "with `FakeIntentInterpreter([...])` — the reminder flow must never call an LLM."
         )
 
 

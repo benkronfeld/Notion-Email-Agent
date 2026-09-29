@@ -443,16 +443,21 @@ async def _cancel(
 
 
 async def _flip_to_pending(session: AsyncSession, reminder_id: UUID, *, now: datetime) -> bool:
-    """Resurrect a skipped reminder. True only if a row changed.
+    """Resurrect a cancelled reminder — `skipped` or `superseded`. True if a row changed.
 
-    Everything the skip set is cleared, not just the status: a resurrected row must be
-    indistinguishable from a freshly inserted `pending` one, or the scheduler would claim
+    Both statuses are accepted because the planner revives both (see
+    `planner._is_revivable`): a `skipped` row when the item becomes active and incomplete
+    again, and a `superseded` row when its due date comes back. `sent` and `failed` rows
+    are still untouchable — the two terminal outcomes are not revivals.
+
+    Everything the cancellation set is cleared, not just the status: a resurrected row must
+    be indistinguishable from a freshly inserted `pending` one, or the scheduler would claim
     it carrying a stale backoff. `claimed_at` is cleared for the same reason — the row is
     not in flight yet.
     """
     result = await session.execute(
         update(Reminder)
-        .where(Reminder.id == reminder_id, Reminder.status == "skipped")
+        .where(Reminder.id == reminder_id, Reminder.status.in_(("skipped", "superseded")))
         .values(
             status="pending",
             skip_reason=None,

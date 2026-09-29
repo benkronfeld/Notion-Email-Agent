@@ -191,6 +191,13 @@ class EmailThread(Base):
             "state IN ('open','awaiting_clarification','closed')",
             name="ck_email_threads_state",
         ),
+        # One reminder starts one Gmail thread (`thread_id=None` on send), so a second
+        # thread row for the same Gmail thread is a duplicate mapping and must fail loudly
+        # rather than shadow the first. This also makes the reply pipeline's thread→item
+        # lookup a single-row lookup, which is where "exactly one item" comes from.
+        # The migration has enforced this since 0001; the constraint is declared here too
+        # so the model and the schema agree and an autogenerate renders an empty diff.
+        UniqueConstraint("provider_thread_id", name="uq_email_threads_provider_thread_id"),
     )
 
     id: Mapped[UUID] = mapped_column(

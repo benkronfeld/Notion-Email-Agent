@@ -41,7 +41,7 @@ AuditEvent = Literal[
     "reminder_failed",
     "presend_check_skipped",
     "system_alert_sent",
-    # V1 (build phases 4-6) — do not emit
+    # V1 (build phases 4-6)
     "inbound_email_received",
     "inbound_ignored",
     "inbound_unmapped",
@@ -50,6 +50,10 @@ AuditEvent = Literal[
     "notion_update_attempted",
     "notion_update_succeeded",
     "notion_update_failed",
+    # V1 addition (§2.3.2.E "flagged in the audit log"): a `processed_inbound_messages` row
+    # left `processing` past its deadline. The spec required the row be flagged but did not
+    # name the event, so this one is recorded in §2.3.5 as of the same change.
+    "inbound_stuck",
 ]
 
 # The database an item lives in is the primary determinant of its kind (spec §1.2).
@@ -159,37 +163,71 @@ class PlannerReminder:
     skip_reason: SkipReason | None
 
 
-# ── V1 placeholders ─────────────────────────────────────────────────────────
-# The reply pipeline is not implemented in the MVP. These exist so the
-# `IntentInterpreter` port type-checks and keeps its spec-defined shape (§2.3.6).
-# V1 replaces them with the real schema in §2.3.4.
+# ── Reply flow (V1, build phases 4-6) ───────────────────────────────────────
+#
+# The structured intent itself lives in `app.domain.intents` — it is Pydantic, because
+# §2.3.4 makes validating the model's output mandatory, and these are plain dataclasses.
+# What is here is the *adapter boundary*: what the mail adapter hands back, and what the
+# app hands to the interpreter. Neither crosses into business rules.
+
+
+@dataclass(frozen=True, slots=True)
+class InboundMessage:
+    """One inbound email as the mail adapter hands it back (§2.3.2.E).
+
+    Everything the pipeline needs to decide what to do with it, and nothing it does not:
+    the two provider ids for thread→item mapping, the sender for the allowlist, the reply
+    headers for the `References` fallback, the new reply text, and the two headers that
+    identify an auto-reply.
+
+    `auto_submitted` and `precedence` are carried as explicit values rather than as a raw
+    header mapping so that auto-reply detection stays a pure, unit-testable predicate over
+    a `InboundMessage` — and so a fake can construct one without synthesizing a MIME
+    payload. Both are `None` when the header is absent.
+
+    `body_text` is the *whole* body as received; stripping quoted history and signatures is
+    `parse.extract_reply_text`'s job, deliberately kept out of the adapter so the stripping
+    rules are testable without a Gmail response.
+    """
+
+    provider_message_id: str
+    provider_thread_id: str | None
+    from_address: str
+    subject: str
+    in_reply_to: str | None
+    references: tuple[str, ...]
+    body_text: str
+    received_at: datetime
+    auto_submitted: str | None = None
+    precedence: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PollResult:
+    """The result of one inbound poll (§2.3.6).
+
+    `history_id` is the cursor to store for next time. It is returned even when `messages`
+    is empty — a poll that found nothing still advanced Gmail's history, and not storing
+    the new cursor would mean re-scanning the same window forever.
+    """
+
+    messages: tuple[InboundMessage, ...] = ()
+    history_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class InterpretationContext:
-    """V1 placeholder — reply text plus that one item's context (§2.3.4)."""
+    """What the interpreter is allowed to see about one reply and one item (§2.3.4).
+
+    Deliberately narrow. The item's name and course are context only; nothing else about
+    the owner is sent. `pending_clarification` is present so a follow-up reply can be read
+    against the question that prompted it.
+    """
 
     reply_text: str
     item_name: str
     item_course: str | None
     status: str
     due_date: date | None
-
-
-@dataclass(frozen=True, slots=True)
-class Intent:
-    """V1 placeholder — the structured intent the LLM returns (§2.3.4)."""
-
-    action: str
-    status: str | None = None
-    due_date_text: str | None = None
-    needs_clarification: bool = False
-    clarification_question: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class PollResult:
-    """V1 placeholder — the result of an inbound poll (§2.3.6)."""
-
-    messages: tuple[object, ...] = ()
-    history_id: str | None = None
+    allowed_statuses: tuple[str, ...]
+    pending_clarification: str | None = None

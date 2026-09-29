@@ -1,8 +1,12 @@
 """APScheduler wiring and the cross-instance advisory lock (spec §2.3.2.C, §2.3.2.F).
 
-Three jobs run in-process from the FastAPI lifespan: an hourly Notion sync, a daily full
-reconcile at ``settings.full_reconcile_at`` local time, and the reminder scheduler tick.
-There is deliberately **no Gmail poll job** — inbound email is V1 (build phase 4).
+Four jobs run in-process from the FastAPI lifespan: an hourly Notion sync, a daily full
+reconcile at ``settings.full_reconcile_at`` local time, the reminder scheduler tick, and the
+Gmail poll that reads replies. The poller was V1 (build phase 4); it is the only job that
+both reads mail and can write to Notion, and every side effect it produces goes through
+``InboundService``'s pipeline, which is where the dedupe and the write verification live.
+The poll body also flags stuck ``processing`` rows, so a reply abandoned by a crash is
+noticed on the next tick rather than never.
 
 Every job body runs inside a Postgres advisory lock so that two app instances during a
 deploy can never both process reminders (spec §2.3.2.C). The lock is *session*-scoped, so
@@ -41,6 +45,7 @@ from app.logging import get_logger, job_context
 JOB_NOTION_SYNC = "notion_sync"
 JOB_FULL_RECONCILE = "full_reconcile"
 JOB_REMINDER_SCHEDULER = "reminder_scheduler"
+JOB_GMAIL_POLLER = "gmail_poller"
 
 # Fixed 64-bit advisory lock key. A literal, never `hashtext(...)` at runtime: the key must
 # be identical in every process and every deploy, and a hash of a string is neither
@@ -103,10 +108,27 @@ async def _run_reminder_tick(container: AppContainer) -> None:
     await service.tick()
 
 
+async def _run_gmail_poll(container: AppContainer) -> None:
+    """One inbound poll, then a check for abandoned messages (build phase 4).
+
+    The order matters: flagging first would report rows that this very run is about to
+    rescue is impossible (a stuck row is never retried), so flagging after processing keeps
+    the alert about rows that are genuinely abandoned. A `poll_new` failure propagates and
+    the job-failure handler alerts `gmail_poll_failed` — the service deliberately does not
+    also alert, so one outage produces one alert rather than two.
+    """
+    from app.services.inbound_service import InboundService
+
+    service = InboundService(container)
+    await service.poll_once()
+    await service.flag_stuck()
+
+
 _JOB_BODIES: dict[str, Callable[[AppContainer], Awaitable[None]]] = {
     JOB_NOTION_SYNC: _run_notion_sync,
     JOB_FULL_RECONCILE: _run_full_reconcile,
     JOB_REMINDER_SCHEDULER: _run_reminder_tick,
+    JOB_GMAIL_POLLER: _run_gmail_poll,
 }
 
 
@@ -120,6 +142,7 @@ _JOB_ALERT_TYPES: dict[str, str] = {
     JOB_NOTION_SYNC: "notion_sync_failed",
     JOB_FULL_RECONCILE: "notion_sync_failed",
     JOB_REMINDER_SCHEDULER: "reminder_send_failed",
+    JOB_GMAIL_POLLER: "gmail_poll_failed",
 }
 
 
@@ -292,6 +315,17 @@ def start_scheduler(container: AppContainer) -> AsyncIOScheduler:
         replace_existing=True,
     )
 
+    scheduler.add_job(
+        _job_entry(container, JOB_GMAIL_POLLER),
+        trigger=IntervalTrigger(seconds=settings.gmail_poll_interval_sec, timezone=tz),
+        id=JOB_GMAIL_POLLER,
+        name="Gmail reply poller",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=settings.gmail_poll_interval_sec,
+        replace_existing=True,
+    )
+
     scheduler.start()
     return scheduler
 
@@ -313,6 +347,7 @@ def configured_job_names() -> tuple[str, ...]:
 __all__: list[str] = [
     "ADVISORY_LOCK_KEY",
     "JOB_FULL_RECONCILE",
+    "JOB_GMAIL_POLLER",
     "JOB_NOTION_SYNC",
     "JOB_REMINDER_SCHEDULER",
     "configured_job_names",

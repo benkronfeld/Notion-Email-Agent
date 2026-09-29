@@ -41,7 +41,7 @@ from app.db.repositories import state as state_repo
 from app.db.session import create_session_factory
 from app.domain.planner import PlannerPolicy
 from app.domain.types import NormalizedItem
-from app.integrations.gmail.compose import render_reminder
+from app.integrations.gmail.compose import reminder_subject, render_reminder
 from app.integrations.notion.normalize import normalize_page
 from app.services.alert_service import ALERT_TYPES, AlertService, last_alert_key
 from app.services.reminder_service import (
@@ -641,6 +641,111 @@ class TestStaleClaimRecovery:
         assert len(sent_audits) == 1
         assert sent_audits[0].payload["recovered_from_stale_claim"] is True
         assert await audits(session, "reminder_sent", item_id=item_b.id) == []
+
+    async def test_a_recovered_send_writes_the_thread_mapping_and_survives_a_second_sweep(
+        self,
+        session: AsyncSession,
+        settings: Settings,
+        frozen_clock: Any,
+        mail: FakeMailClient,
+        service: ReminderService,
+    ) -> None:
+        """A recovered reminder must be answerable, and the backfill must be repeatable.
+
+        The crashed send never reached `_record_sent`, so without the backfill no
+        `email_threads` row would name the Gmail thread and V1 would audit a reply to this
+        reminder `inbound_unmapped` (§2.3.2.E step 3). The ids written must be the ones
+        Gmail reported, not recomposed ones — that is the whole point of asking Gmail.
+        """
+        page_id = "page-stale-d"
+        item = await arrange(session, frozen_clock, page_id=page_id)
+        row = {r.reminder_type: r for r in await load_reminders(session, item.id)}["assignment_48h"]
+
+        view = normalize_page(
+            pages.make_assignment(page_id=page_id, name="Problem Set 4"),
+            source_db="assignments_readings",
+            tz=settings.tz,
+            default_due_time=settings.default_due_time,
+        )
+        subject, body = render_reminder(view, "assignment_48h", settings.tz, row.ref_token)
+        really_sent = await mail.send(
+            to=settings.reminder_recipient,
+            subject=subject,
+            body=body,
+            thread_id=None,
+            in_reply_to=None,
+        )
+
+        # The state a crash between claim and outcome leaves behind.
+        await session.execute(
+            update(Reminder)
+            .where(Reminder.id == row.id)
+            .values(
+                status="claimed",
+                claimed_at=frozen_clock.now() - STALE,
+                attempt_count=1,
+                next_attempt_at=None,
+                sent_at=None,
+                provider_message_id=None,
+                provider_thread_id=None,
+                last_error=None,
+            )
+        )
+        await session.commit()
+
+        assert await service.recover_stale_claims() == 1
+
+        threads = list(
+            (
+                await session.execute(select(EmailThread).where(EmailThread.item_id == item.id))
+            ).scalars()
+        )
+        assert len(threads) == 1
+        thread = threads[0]
+        assert thread.provider_thread_id == really_sent.provider_thread_id
+        assert thread.reminder_id == row.id
+        assert thread.root_rfc_message_id == really_sent.rfc_message_id
+        # Recomposed from the stored item, exactly as `_record_sent` would have stored it.
+        assert thread.subject == reminder_subject(
+            normalized_item(page_id=page_id), "assignment_48h", settings.tz
+        )
+
+        messages = list(
+            (
+                await session.execute(
+                    select(OutboundMessage).where(OutboundMessage.thread_id == thread.id)
+                )
+            ).scalars()
+        )
+        assert len(messages) == 1
+        assert messages[0].provider_message_id == really_sent.provider_message_id
+        assert messages[0].rfc_message_id == really_sent.rfc_message_id
+        assert messages[0].kind == "reminder"
+
+        # A second sweep sees nothing (`sent` is not `claimed`), so it neither raises nor
+        # duplicates.
+        assert await service.recover_stale_claims() == 0
+
+        # And the backfill's own guard: force the row back to `claimed`, as a recovery whose
+        # commit was lost would leave it, and sweep again. The rows already exist, so the
+        # lookup must short-circuit rather than let the UNIQUE constraints throw.
+        await session.execute(
+            update(Reminder)
+            .where(Reminder.id == row.id)
+            .values(status="claimed", claimed_at=frozen_clock.now() - STALE)
+        )
+        await session.commit()
+        assert await service.recover_stale_claims() == 1
+        thread_count = await session.scalar(
+            select(func.count()).select_from(EmailThread).where(EmailThread.item_id == item.id)
+        )
+        message_count = await session.scalar(
+            select(func.count())
+            .select_from(OutboundMessage)
+            .where(OutboundMessage.thread_id == thread.id)
+        )
+        assert thread_count == 1
+        assert message_count == 1
 
     async def test_a_fresh_claim_is_not_touched(
         self,

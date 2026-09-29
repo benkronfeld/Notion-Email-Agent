@@ -44,4 +44,8 @@ EXPOSE 8000
 
 # Railway injects $PORT; a plain `docker run` without it falls back to 8000. `exec` keeps
 # uvicorn as PID 1 so it receives SIGTERM directly and shuts down gracefully.
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+#
+# `app.asgi:app`, not `app.main:app`: `main` exposes `create_app` and deliberately has no
+# module-level app, because the one that reads `.env` must not be a module the test suite
+# imports. See `src/app/asgi.py`.
+CMD ["sh", "-c", "exec uvicorn app.asgi:app --host 0.0.0.0 --port ${PORT:-8000}"]

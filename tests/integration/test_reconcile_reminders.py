@@ -261,6 +261,50 @@ class TestDueDateChange:
         assert await repo.reconcile_reminders(session, moved, EARLY, POLICY) == []
         assert await audit_total(session, moved.id) == audit_after_first
 
+    async def test_a_reverted_due_date_revives_the_original_rows(
+        self, session: AsyncSession
+    ) -> None:
+        """date A -> date B -> date A: the restored date must not lose its reminders.
+
+        The literal §2.3.2.B step 2 revives `skipped` rows only, so the date-A rows would
+        stay `superseded` while still holding the unique key for that date, and no
+        `InsertReminder` could be produced for it — a silently lost reminder. Here the SQL
+        half must do the flip the planner asked for, against the real unique constraint.
+        """
+        item = await store_item(session)
+        await repo.reconcile_reminders(session, item, EARLY, POLICY)
+        original = {row.reminder_type: row.id for row in await reminders_of(session, item)}
+
+        moved = await store_item(session, due_at=NEW_DUE)
+        await repo.reconcile_reminders(session, moved, EARLY, POLICY)
+
+        restored = await store_item(session, due_at=DUE)
+        actions = await repo.reconcile_reminders(session, restored, EARLY, POLICY)
+
+        # date B's two in-flight rows are withdrawn, and date A's two are revived.
+        assert [type(action) for action in actions] == [
+            MarkSuperseded,
+            MarkSuperseded,
+            FlipToPending,
+            FlipToPending,
+        ]
+
+        rows = await reminders_of(session, restored)
+        assert len(rows) == 4  # two per date: the round trip inserted nothing new
+        back = [row for row in rows if row.due_at_snapshot == DUE]
+        assert {row.id for row in back} == set(original.values())
+        assert {row.status for row in back} == {"pending"}
+        assert {row.skip_reason for row in back} == {None}
+        assert {row.claimed_at for row in back} == {None}
+        assert {row.next_attempt_at for row in back} == {None}
+
+        # The restored rows are genuinely claimable again, not merely `pending` on paper.
+        claimed = await repo.claim_next(session, T48)
+        assert claimed is not None and claimed.due_at_snapshot == DUE
+
+        # And the round trip settles: nothing further to do.
+        assert await repo.reconcile_reminders(session, restored, EARLY, POLICY) == []
+
 
 class TestCompletionAndActivity:
     """FR-3 / FR-9: completed and archived items send nothing."""
