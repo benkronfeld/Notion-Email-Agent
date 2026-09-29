@@ -2,11 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: MVP complete
+## Status: complete (MVP + V1)
 
-The MVP (build phases 1–3) is implemented and verified: **333 tests pass** — 199 unit, 129 integration against a real PostgreSQL 16, and 5 end-to-end. There is still **no LLM call anywhere in the flow**.
+Both milestones are implemented and verified: **571 tests pass** — 392 unit, 25 contract, 144 integration against a real PostgreSQL 16, and 10 end-to-end. Build phases 1–6 are done, so the reply-to-edit flow works end to end and the LLM appears in exactly one place: `DeepSeekInterpreter`, turning reply text into a structured intent.
 
-V1 (phases 4–6) has not been started. `MailClient.poll_new` and `NotionClient.update_page` raise `NotImplementedError`, and the `IntentInterpreter` port is declared with no implementation.
+Nothing has ever spoken to a live Notion, Gmail, or DeepSeek — by design (constraint 5), and that is now the only thing between this and a working deployment. See `Project_status.md` for the four go-live items.
 
 `.env` holds real secrets and is gitignored; `.env.example` is the tracked template. Every configurable value is documented there.
 
@@ -29,17 +29,21 @@ Update these after any major milestone or major addition to the project.
 
 A single-user backend service that reads school deadlines from two Notion databases, emails reminders at fixed times before each deadline, and (in V1) lets the owner reply to a reminder to change that item's status and/or due date. Full jobs-to-be-done and non-goals are in §1.1; the goal here is small, reliable, and auditable — it touches real deadlines, so being conservative beats being clever.
 
-### Current milestone
+### Milestones
 
-**MVP** (reminders only, no LLM call anywhere in the flow)
+**MVP** (build phases 1–3, reminders only, no LLM): §1.2 criteria 1–5 — discovery within one
+hourly sync, correct targets with no late sends, nothing for completed or archived items,
+each reminder sent once within about five minutes, every event audited. **Complete.**
 
-1. A new item in either database is discovered within about one hourly sync.
-2. Correct targets are computed; missed windows are never sent late.
-3. Completed and archived items send nothing.
-4. Each reminder is sent once, within about 5 minutes of its target.
-5. Every event is in the audit log.
+**V1** (build phases 4–6, reply-to-edit): §1.2 criteria 6–10 — a reply maps to exactly one
+item by stored Gmail IDs; clear and combined changes are applied and read-back verified;
+ambiguous replies produce a question and zero writes; duplicates are processed once; every
+actionable reply gets an accurate confirmation or failure email. **Complete.**
 
-The MVP is build phases 1–3 (see below) and is independently useful and testable. V1 (phases 4–6) adds reply-to-edit; its success criteria are §1.2's numbered list 6–10. Don't pull V1 work — or any LLM call — into the MVP.
+The two are sequenced deliberately and the rule still applies to future work: **no LLM call
+belongs in the reminder flow.** The model's only job is turning reply text into a structured
+intent — it never schedules, decides eligibility, deduplicates, identifies items, or computes
+dates. Keep new decision logic in `domain/`, where it is pure and unit-testable.
 
 ## Commands
 
@@ -71,15 +75,21 @@ truncate each other's rows. Use `127.0.0.1`, **not** `localhost`: `localhost` re
 **Running the service.**
 
 ```bash
-uv run uvicorn app.main:app --reload      # admin API; scheduler starts in the lifespan
+uv run uvicorn app.asgi:app --reload      # admin API; scheduler starts in the lifespan
 uv run python -m app.cli gmail-auth       # one-time Google OAuth; prints a refresh token
 ```
 
 Everything except `/healthz` needs `Authorization: Bearer $ADMIN_API_TOKEN`.
 
-Tests are split by kind — `tests/unit`, `tests/integration`, `tests/e2e`; see **Layout**
-under Architecture. `.github/workflows/ci.yml` exists but has never run (this repo has no
-remote), so treat it as unverified configuration.
+Tests are split by kind — `tests/unit`, `tests/contract`, `tests/integration`, `tests/e2e`;
+see **Layout** under Architecture. `.github/workflows/ci.yml` exists but has never run, so
+treat it as unverified configuration.
+
+If a run and another test run must not truncate each other's rows, point one at its own
+database with `TEST_DATABASE_URL`. The integration harness creates and migrates whatever
+that variable names. The same applies to a stale test process: it can hold an
+`idle in transaction` lock on the shared test database and block every later run's
+`TRUNCATE`, which shows up as a suite that hangs rather than fails.
 
 ## Architecture
 
@@ -104,6 +114,9 @@ notion-email-agent/              # this repo's root directory
 ├── migrations/                     # Alembic versions
 ├── src/app/
 │   ├── main.py                     # FastAPI app, lifespan starts scheduler
+│   ├── asgi.py                     # uvicorn entrypoint (app.asgi:app); the only module
+│   │                               # that reads the environment at import time
+│   ├── bootstrap.py                # build_container(settings): the real adapter set
 │   ├── config.py                   # Pydantic Settings
 │   ├── clock.py                    # Clock port + SystemClock
 │   ├── logging.py
@@ -150,7 +163,7 @@ notion-email-agent/              # this repo's root directory
     └── fixtures/
 ```
 
-The paths above are the intended shape, not a description of what exists — nothing is scaffolded yet.
+Every path above now exists. The tree describes the code as built, not an intended shape.
 
 ### `reconcile_reminders(item, now)` is the crux
 
@@ -263,14 +276,15 @@ No test, CI job, fixture, or local experiment makes a live Notion, Gmail, or Dee
 
 ## Build phases (Appendix C)
 
-Build in this order — the MVP must be complete and working before V1 starts.
+All six are complete. The order below is the order they were built in, and it is why the
+reminder flow is LLM-free: V1 could not start until the MVP was working.
 
-1. **Notion read + local DB**: config, Notion adapter, normalization, 11:59 PM rule, upsert, daily reconcile.
-2. **Reminder engine**: rules, planner/`reconcile_reminders`, scheduler with claims, missed-window and completed handling, audit.
-3. **Email sending + thread mapping**: Gmail OAuth CLI, compose, send, store message/thread IDs, stale-claim recovery, failure alerts. ← **MVP done**
-4. **Inbound handling**: poller, dedupe, sender allowlist, item mapping, reply-text extraction.
-5. **AI interpretation**: intent schema, DeepSeek adapter, date resolver, validator, clarification loop.
-6. **Safe writes**: NotionWriter, read-back verification, confirmation/failure emails, local update plus reconcile. ← **V1 done**
+1. **Notion read + local DB**: config, Notion adapter, normalization, 11:59 PM rule, upsert, daily reconcile. **Done**
+2. **Reminder engine**: rules, planner/`reconcile_reminders`, scheduler with claims, missed-window and completed handling, audit. **Done**
+3. **Email sending + thread mapping**: Gmail OAuth CLI, compose, send, store message/thread IDs, stale-claim recovery, failure alerts. **MVP done**
+4. **Inbound handling**: poller, dedupe, sender allowlist, item mapping, reply-text extraction. **Done**
+5. **AI interpretation**: intent schema, DeepSeek adapter, date resolver, validator, clarification loop. **Done**
+6. **Safe writes**: NotionWriter, read-back verification, confirmation/failure emails, local update plus reconcile. **V1 done**
 
 ## Open items (Appendix D)
 

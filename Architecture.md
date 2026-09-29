@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status: the MVP (build phases 1–3) is built; V1 is not.** Sections 1, 3 and 4 describe the system as it now exists, except where they name reply-flow components — `InboundService`, `NotionWriter`, `date_resolver`, `validator`, and the `IntentInterpreter` implementation are designed but not written. `MailClient.poll_new` and `NotionClient.update_page` are `Protocol` methods that raise `NotImplementedError`. Section references (§) point to [`project_spec final.md`](project_spec%20final.md), which is authoritative if the two ever disagree.
+> **Status: complete — build phases 1–6 are built.** Sections 1, 3 and 4 describe the system as it now exists, including the reply flow. `MailClient.poll_new` and `NotionClient.update_page` are implemented; `InboundService`, `NotionWriter`, `date_resolver`, `validator`, and the DeepSeek `IntentInterpreter` are written. Section references (§) point to [`project_spec final.md`](project_spec%20final.md), which is authoritative if the two ever disagree.
 
 ## 1. Overview
 
@@ -16,7 +16,7 @@ It talks to three external systems:
 
 There is no frontend. The owner interacts through Notion and email. A token-protected admin API exists for health checks, manual job triggers, and inspecting state (§2.3.6).
 
-**Deployment:** one always-on container plus one managed PostgreSQL 16, both on Railway. FastAPI serves the admin API; APScheduler runs four jobs inside the app lifespan, guarded by a Postgres advisory lock so overlapping deploys can't double-process.
+**Deployment:** one always-on container plus one managed PostgreSQL 16, both on Railway. FastAPI serves the admin API; APScheduler runs four jobs inside the app lifespan, guarded by a Postgres advisory lock so overlapping deploys can't double-process. The ASGI entrypoint is `app.asgi:app`; `app.main` stays import-pure (it exposes `create_app` and no module-level app) so that the one module which reads `.env` is never imported by the test suite.
 
 ## 2. Data flow
 
@@ -113,7 +113,12 @@ Every external dependency sits behind an interface so it can be swapped and fake
 | `notion_sync` | 60 min | Incremental page query per data source, upsert, reconcile |
 | `full_reconcile` | Daily, 04:00 ET | Query all pages; deactivate anything trashed or missing |
 | `reminder_scheduler` | 5 min | Claim and send due reminders |
-| `gmail_poller` | 90 s | Poll for replies, run the inbound pipeline |
+| `gmail_poller` | 90 s | Poll for replies, run the inbound pipeline, then flag stuck `processing` rows |
+
+The Gmail poller is the only job that both reads mail and can write to Notion, and it is the
+only place an LLM is consulted. Everything it produces goes through `InboundService`, where
+the dedupe, the deterministic validation, and the write verification live; the job body adds
+nothing of its own beyond flagging abandoned messages.
 
 ## 4. Invariants that span components
 
