@@ -27,6 +27,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) in spiri
 - **A reverted due date lost its reminders.** Spec §2.3.2.B step 2 revived a `skipped` reminder but not a `superseded` one, so a due date moved away and back left the original rows occupying the unique key and the restored date received no reminder — a silently lost reminder. A `superseded` row whose `due_at_snapshot` matches the restored date now flips back to `pending` under the same guards as a skip, and `_flip_to_pending` accepts it. A `sent` row is still never revived.
 - **Stale-claim recovery wrote no thread-mapping rows.** It marked a reminder `sent` after a crash without creating `email_threads`/`outbound_messages`, so a reply to a recovered reminder would have found no mapping and been audited `inbound_unmapped`. Recovery now writes both rows from the ids Gmail returns, idempotently, so a second pass neither raises nor duplicates.
 - **`email_threads.provider_thread_id` was `UNIQUE` in migration `0001` but not in the model**, so the model and the schema disagreed. Declared on the model for parity.
+- **Two docstrings in `src/app/db/repositories/reminders.py` stated things the reverted-due-date fix had made false** — that a resurrection "only touches a `skipped` one", and that "a superseded row is never revived by the planner". The behaviour they described (`skip_reason = None` on supersession) is unchanged and still correct; the reasoning given for it was not. Comments only.
 
 #### Changed
 
@@ -37,6 +38,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) in spiri
 - `tests/unit/test_fixtures_smoke.py` — the MVP's "no write" and "no LLM" guards are replaced by tests of the V1 behaviour, while the unscripted-interpreter guard is kept.
 - `project_spec final.md` — §2.2 (the `openai` pin and the lazy client), §2.3.2.B (the reverted-due-date rule, and the "Known gap" note replaced by the closure), §2.3.2.C (recovery writes the thread rows), §2.3.3 (the tree gains `asgi.py`, `bootstrap.py`, `db/repositories/inbound.py`, `tests/contract/`), §2.3.4 (the alert vocabulary as a table), §2.3.5 (`inbound_stuck` added to the closed audit vocabulary).
 - `Architecture.md`, `Project_status.md`, `CLAUDE.md` — updated for V1: the run command is `app.asgi:app`, both milestones are complete, and the "Carried into V1" items are closed.
+- `CLAUDE.md` — reviewed against the codebase once V1 landed. Corrected a duplicated `.env` paragraph, added `container.py`/`AppContainer` to the layout and architecture sections (the dependency-injection seam every test relies on was undocumented) and `tests/e2e/` to the tree, and reconciled the open-items list with the four go-live items. Added the non-obvious traps: how to run a single test, that migrations are hand-written because `--autogenerate` cannot express the partial indexes, and the test conventions (`--strict-markers`, `asyncio_mode=auto`, the harness fixtures imported by name into each database-backed conftest, and the deliberate absence of `__init__.py` under `tests/`).
 
 ### 2026-09-28
 
