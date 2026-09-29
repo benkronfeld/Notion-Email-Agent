@@ -4,8 +4,9 @@
 are `async` and return concrete lists rather than an `Iterable`, because the app runs on
 an async event loop and page counts here are small. See the spec amendment in §2.3.6.
 
-`update_page` is V1 (build phase 6). It is declared so the port matches the spec's shape
-and so a future implementation has a fixed target — nothing in the MVP calls it.
+`update_page` is V1 (build phase 6): the port's shape is fixed by §2.3.6, and
+`NotionRestClient` implements it as one `PATCH` built from only the changed properties.
+Nothing in the MVP calls it.
 
 `NotionRestClient` below is the live adapter. It is constructed once at startup and held
 on `AppContainer`; **no test may construct it or trigger a request** (CLAUDE.md
@@ -184,10 +185,37 @@ class NotionRestClient(NotionClient):
         due_property: str,
         due_date: date | None,
     ) -> None:
-        """V1 (build phase 6). The MVP never writes to Notion, so this is deliberately absent."""
-        raise NotImplementedError(
-            "Notion writes are V1 (build phase 6); the MVP's write surface is empty"
+        """One `PATCH /v1/pages/{id}` carrying only the properties that changed (§2.3.4).
+
+        **The body is assembled, not decided here.** Which properties changed is
+        `NotionWriter`'s decision; a `None` argument means "not part of this write" and is
+        left out of the body entirely, so this method can only ever write the three
+        properties CLAUDE.md constraint 6 allows. It writes them by **option name**, which is
+        why nothing here pre-fetches Notion's option ids.
+
+        `None` cannot express "clear the due date", and this app never clears one, so the
+        ambiguity is harmless: an absent `due_date` means "unchanged", not "empty". (A
+        deliberate `{"date": None}` would be the way to clear it, and it would need its own
+        argument rather than an overloaded `None`.)
+
+        `done_property is None` means the item's database has `HAS_DONE=false`; passing a
+        `done_value` alongside it is a caller bug, not something to silently drop, so it
+        raises. Nothing here retries beyond `_request`'s own transient policy: a write is
+        applied at most once per attempt, and verification is the caller's job.
+
+        Both refusals live in `_update_body`, which is pure — so they are checked before any
+        request is built, and a unit test can reach them without constructing this class
+        (constraint 5).
+        """
+        body = _update_body(
+            status_property=status_property,
+            status_name=status_name,
+            done_property=done_property,
+            done_value=done_value,
+            due_property=due_property,
+            due_date=due_date,
         )
+        await self._request("PATCH", f"/v1/pages/{page_id}", json_body=body)
 
     # ── Transport ───────────────────────────────────────────────────────────
 
@@ -245,6 +273,60 @@ class NotionRestClient(NotionClient):
             if not next_cursor:
                 return pages
             cursor = next_cursor
+
+
+# ── Payload building ────────────────────────────────────────────────────────
+
+
+def _update_body(
+    *,
+    status_property: str,
+    status_name: str | None,
+    done_property: str | None,
+    done_value: bool | None,
+    due_property: str,
+    due_date: date | None,
+) -> dict[str, Any]:
+    """The `PATCH /v1/pages/{id}` body for the properties that are part of this write.
+
+    Pure, and separate from the transport on purpose: the three payload shapes below are the
+    write surface (CLAUDE.md constraint 6) and are the one thing here worth pinning in a unit
+    test, which cannot construct `NotionRestClient` at all (constraint 5).
+
+    Shapes, verified against Notion's `PATCH /v1/pages/{id}` reference (§2.3.4):
+
+    - status: `{"<StatusProp>": {"status": {"name": "<name>"}}}`
+    - checkbox: `{"<DoneProp>": {"checkbox": true|false}}`
+    - date: `{"<DueProp>": {"date": {"start": "YYYY-MM-DD"}}}`
+
+    Writing by option **name** is what makes the option-id pre-fetch unnecessary. The
+    databases use a `status` property type (not `select`), so the `select` variant §2.3.4
+    mentions as a fallback is not produced.
+
+    Two refusals, both raising `ValueError` before any request exists:
+
+    - Nothing to change. An empty `properties` object is accepted by Notion and changes
+      nothing, so sending it would be a silent no-op reported as a successful write.
+    - A `done_value` with no `done_property`. That combination means the caller thinks the
+      database has a `Done` property when `HAS_DONE` says it does not; dropping the value
+      quietly would hide the disagreement.
+    """
+    if status_name is None and done_value is None and due_date is None:
+        raise ValueError("update_page called with nothing to change")
+    if done_property is None and done_value is not None:
+        raise ValueError(
+            "done_value was given without a done_property; this database has no `Done` "
+            "property (settings.has_done_property is False)"
+        )
+
+    properties: dict[str, Any] = {}
+    if status_name is not None:
+        properties[status_property] = {"status": {"name": status_name}}
+    if done_property is not None and done_value is not None:
+        properties[done_property] = {"checkbox": done_value}
+    if due_date is not None:
+        properties[due_property] = {"date": {"start": due_date.isoformat()}}
+    return {"properties": properties}
 
 
 # ── Payload parsing ─────────────────────────────────────────────────────────

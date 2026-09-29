@@ -286,8 +286,9 @@ class TestDueDateChange:
         assert {a.due_at_snapshot for a in inserted} == {self.NEW_DUE}
 
     def test_a_due_date_change_supersedes_rather_than_skips(self) -> None:
-        # The distinction is load-bearing: a superseded row is never revived, so moving a
-        # due date away and back does not resurrect the old schedule.
+        # The distinction still matters: a skip is revived by the item changing (step 2's
+        # symmetric transition), whereas a supersede is only revived by its own date coming
+        # back. The two states must not be collapsed into one.
         existing = [make_reminder("assignment_24h", target_at=T24, reminder_id=R24)]
         actions = plan_reminders(make_item(due_at=self.NEW_DUE), existing, EARLY, POLICY)
         assert not any(isinstance(a, MarkSkipped) for a in actions)
@@ -429,22 +430,95 @@ class TestIdempotence:
 
 
 class TestRevertedDueDate:
-    """Documents an edge the spec does not cover — flagged, not silently "fixed".
+    """A due date that moves away and comes back keeps its reminders.
 
-    §2.3.2.B step 2 revives a `skipped` row but says nothing about a `superseded` one. So
-    if a due date moves away and then back, the original rows still occupy the unique key
-    `(item_id, reminder_type, due_at_snapshot)` and stay superseded: the item receives no
-    reminder for the restored date. That is literal spec behaviour, and it is a silently
-    lost reminder — the exact outcome CLAUDE.md constraint 7 exists to prevent.
+    §2.3.2.B step 2 revives a `skipped` row but says nothing about a `superseded` one, so
+    the literal algorithm leaves the original rows holding the unique key
+    `(item_id, reminder_type, due_at_snapshot)` and the restored date receives no reminder
+    at all — a silently lost reminder, the exact outcome CLAUDE.md constraint 7 exists to
+    prevent. The planner deliberately closes that gap: a `superseded` row is flipped back
+    to `pending` when its own snapshot *is* the item's current due date, on exactly the
+    same terms as a revived skip (target still in the future, item active and incomplete).
+    FR-4 is not weakened by this — a target behind us is never revived.
     """
 
-    def test_a_reverted_due_date_leaves_superseded_rows_alone(self) -> None:
+    def test_a_reverted_due_date_revives_the_superseded_rows(self) -> None:
         existing = [
             make_reminder("assignment_48h", target_at=T48, reminder_id=R48, status="superseded"),
             make_reminder("assignment_24h", target_at=T24, reminder_id=R24, status="superseded"),
         ]
         # The due date is back to DUE, which is exactly what these rows describe.
-        assert plan_reminders(make_item(due_at=DUE), existing, EARLY, POLICY) == []
+        assert plan_reminders(make_item(due_at=DUE), existing, EARLY, POLICY) == [
+            FlipToPending(R48),
+            FlipToPending(R24),
+        ]
+
+    def test_a_superseded_row_whose_target_has_passed_stays_dead(self) -> None:
+        # The revival does not weaken FR-4: a window that is already gone is never sent.
+        now = T24 + timedelta(minutes=1)
+        existing = [
+            make_reminder("assignment_48h", target_at=T48, reminder_id=R48, status="superseded"),
+            make_reminder("assignment_24h", target_at=T24, reminder_id=R24, status="superseded"),
+        ]
+        assert plan_reminders(make_item(due_at=DUE), existing, now, POLICY) == []
+
+    def test_a_superseded_row_for_a_different_date_is_left_alone(self) -> None:
+        # Only a row under the *desired* date is a date that came back. This one describes a
+        # date the item no longer has, so the restored date is scheduled fresh instead.
+        existing = [
+            make_reminder(
+                "assignment_48h",
+                target_at=T48,
+                reminder_id=R48,
+                status="superseded",
+                due_at_snapshot=DUE + timedelta(days=7),
+            )
+        ]
+        actions = plan_reminders(make_item(due_at=DUE), existing, EARLY, POLICY)
+        assert not any(isinstance(a, FlipToPending) for a in actions)
+        inserted = [a for a in actions if isinstance(a, InsertReminder)]
+        assert [a.reminder_type for a in inserted] == ["assignment_48h", "assignment_24h"]
+
+    def test_the_full_round_trip_revives_the_original_rows_without_duplicating_them(self) -> None:
+        """date A -> date B -> date A, through really-applied actions.
+
+        The claim is about the rows, not the plan: the restored date must end up with the
+        same two rows it started with, `pending` (not superseded, and not a second copy).
+        """
+        rows = pending_pair()
+        original_ids = {row.reminder_id for row in rows}
+        new_due = DUE + timedelta(days=7)
+
+        # 1. The date moves away. The old rows are superseded and a fresh schedule appears.
+        first = plan_reminders(make_item(due_at=new_due), rows, EARLY, POLICY)
+        assert [type(action) for action in first] == [
+            MarkSuperseded,
+            MarkSuperseded,
+            InsertReminder,
+            InsertReminder,
+        ]
+        rows = apply_actions(first, rows)
+        assert len(rows) == 4
+        assert {row.status for row in rows if row.due_at_snapshot == DUE} == {"superseded"}
+
+        # 2. The date comes back. The original rows are revived, and — the whole point —
+        #    nothing is inserted, because the unique key they hold is already correct.
+        second = plan_reminders(make_item(due_at=DUE), rows, EARLY, POLICY)
+        assert [a for a in second if isinstance(a, FlipToPending)] == [
+            FlipToPending(R48),
+            FlipToPending(R24),
+        ]
+        assert not any(isinstance(a, InsertReminder) for a in second)
+        rows = apply_actions(second, rows)
+        assert len(rows) == 4  # two rows per date, no duplicates
+
+        restored = [row for row in rows if row.due_at_snapshot == DUE]
+        assert {row.reminder_id for row in restored} == original_ids
+        assert {row.status for row in restored} == {"pending"}
+        assert {row.skip_reason for row in restored} == {None}
+
+        # 3. And the round trip settles.
+        assert plan_reminders(make_item(due_at=DUE), rows, EARLY, POLICY) == []
 
 
 class TestIdempotencyKey:

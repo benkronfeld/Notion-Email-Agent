@@ -17,7 +17,8 @@ import pytest
 from app.config import Settings
 from app.container import AppContainer
 from app.domain.due_time import compute_due_at
-from app.domain.types import InterpretationContext
+from app.domain.intents import ALLOWED_STATUSES, Intent, IntentAction, StatusValue
+from app.domain.types import InboundMessage, InterpretationContext
 from app.integrations.gmail.client import MailClient
 from app.integrations.notion.client import NotionClient
 
@@ -30,6 +31,8 @@ from fixtures.fakes import (
     FakeIntentInterpreter,
     FakeMailClient,
     FakeNotionClient,
+    FakeNotionNotFound,
+    FakeNotionTransient,
     FakeNotionUnreachable,
     make_container,
 )
@@ -198,9 +201,51 @@ async def test_resolve_data_source_id_returns_the_recorded_mapping() -> None:
         await client.resolve_data_source_id("db-unknown")
 
 
-async def test_fake_notion_update_page_raises_because_the_mvp_never_writes() -> None:
+async def test_fake_notion_update_page_applies_the_write_so_read_back_can_verify() -> None:
+    """V1: the fake really mutates the page, which is what makes read-back meaningful."""
+    client = FakeNotionClient([make_assignment(page_id="page-1")])
+
+    await client.update_page(
+        page_id="page-1",
+        status_property="Status",
+        status_name="Completed",
+        done_property="Done",
+        done_value=True,
+        due_property="Due Date",
+        due_date=date(2026, 10, 10),
+    )
+
+    assert len(client.update_page_calls) == 1
+    page = await client.get_page("page-1")
+    assert page is not None
+    assert page.properties["Status"]["status"]["name"] == "Completed"
+    assert page.properties["Done"]["checkbox"] is True
+    assert page.properties["Due Date"]["date"]["start"] == "2026-10-10"
+
+
+async def test_fake_notion_update_page_can_accept_a_write_that_does_not_land() -> None:
+    """`drop_update` is the "PATCH succeeded but read-back disagrees" case (§2.3.4)."""
+    client = FakeNotionClient([make_assignment(page_id="page-1")], drop_update=True)
+
+    await client.update_page(
+        page_id="page-1",
+        status_property="Status",
+        status_name="Completed",
+        done_property="Done",
+        done_value=True,
+        due_property="Due Date",
+        due_date=None,
+    )
+
+    assert len(client.update_page_calls) == 1  # the write was attempted...
+    page = await client.get_page("page-1")
+    assert page is not None
+    assert page.properties["Status"]["status"]["name"] != "Completed"  # ...and did not land
+
+
+async def test_fake_notion_update_page_raises_not_found_for_an_unknown_page() -> None:
     client = FakeNotionClient()
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(FakeNotionNotFound):
         await client.update_page(
             page_id="page-1",
             status_property="Status",
@@ -210,6 +255,36 @@ async def test_fake_notion_update_page_raises_because_the_mvp_never_writes() -> 
             due_property="Due Date",
             due_date=None,
         )
+
+
+async def test_fake_notion_update_page_fails_transiently_then_succeeds() -> None:
+    """`fail_update_times=1` is the writer's one-retry-then-re-verify path."""
+    client = FakeNotionClient([make_assignment(page_id="page-1")], fail_update_times=1)
+
+    with pytest.raises(FakeNotionTransient):
+        await client.update_page(
+            page_id="page-1",
+            status_property="Status",
+            status_name="Completed",
+            done_property="Done",
+            done_value=True,
+            due_property="Due Date",
+            due_date=None,
+        )
+
+    # The retry succeeds, and the write is applied.
+    await client.update_page(
+        page_id="page-1",
+        status_property="Status",
+        status_name="Completed",
+        done_property="Done",
+        done_value=True,
+        due_property="Due Date",
+        due_date=None,
+    )
+    page = await client.get_page("page-1")
+    assert page is not None
+    assert page.properties["Status"]["status"]["name"] == "Completed"
 
 
 # ── FakeMailClient ──────────────────────────────────────────────────────────
@@ -259,26 +334,71 @@ async def test_send_failures_are_injectable_for_the_backoff_and_five_strike_path
     assert await broken.find_sent_by_token("anything") is None
 
 
-async def test_poll_new_raises_because_the_mvp_has_no_inbound_poll() -> None:
-    with pytest.raises(NotImplementedError):
-        await FakeMailClient().poll_new(None)
+async def test_poll_new_drains_the_inbox_and_advances_the_cursor() -> None:
+    """V1: the fake poll hands back what was queued, exactly once.
+
+    Draining is the point — a second poll returns nothing, so a service-level test can tell
+    "the poller saw it twice" apart from "the dedupe caught it the second time".
+    """
+    mail = FakeMailClient()
+    message = InboundMessage(
+        provider_message_id="m-1",
+        provider_thread_id="t-1",
+        from_address="owner@example.test",
+        subject="Re: [Reminder] ...",
+        in_reply_to="<out-1@example.test>",
+        references=("<out-1@example.test>",),
+        body_text="done",
+        received_at=datetime(2026, 10, 1, tzinfo=UTC),
+    )
+    mail.receive(message)
+
+    first = await mail.poll_new(None)
+    assert first.messages == (message,)
+    assert first.history_id is not None
+
+    second = await mail.poll_new(first.history_id)
+    assert second.messages == ()
+    assert mail.poll_calls == [None, first.history_id]
+
+
+async def test_poll_new_raises_when_the_poll_is_configured_to_fail() -> None:
+    mail = FakeMailClient(poll_error=RuntimeError("gmail exploded"))
+    with pytest.raises(RuntimeError):
+        await mail.poll_new(None)
 
 
 # ── FakeIntentInterpreter ───────────────────────────────────────────────────
 
 
-async def test_interpret_raises_because_the_mvp_makes_no_llm_call() -> None:
-    interpreter = FakeIntentInterpreter()
-    context = InterpretationContext(
+def _context() -> InterpretationContext:
+    return InterpretationContext(
         reply_text="done",
         item_name="Problem Set 4",
         item_course="CSE 271",
         status="Not started",
         due_date=date(2026, 10, 3),
+        allowed_statuses=ALLOWED_STATUSES,
     )
+
+
+async def test_unscripted_interpret_raises_so_the_reminder_flow_never_reaches_an_llm() -> None:
+    """The MVP guard survives into V1: an unscripted interpreter still refuses to guess."""
+    interpreter = FakeIntentInterpreter()
+    context = _context()
     with pytest.raises(NotImplementedError):
         await interpreter.interpret(context)
     assert interpreter.calls == [context]
+
+
+async def test_scripted_interpret_returns_the_next_intent_in_order() -> None:
+    first = Intent(action=IntentAction.NO_ACTION)
+    second = Intent(action=IntentAction.CHANGE_STATUS, status=StatusValue.COMPLETED)
+    interpreter = FakeIntentInterpreter([first, second])
+
+    assert await interpreter.interpret(_context()) is first
+    assert await interpreter.interpret(_context()) is second
+    assert len(interpreter.calls) == 2
 
 
 # ── Container, clock, settings ──────────────────────────────────────────────

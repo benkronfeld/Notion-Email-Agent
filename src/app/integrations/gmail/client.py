@@ -3,22 +3,30 @@
 **Frozen interface.** Mirrors §2.3.6, with the same async refinement as `NotionClient`.
 
 The MVP uses `send` (phase 3) and `find_sent_by_token` (stale-claim recovery, phase 3).
-`poll_new` is V1 (phase 4) and is declared only.
+`poll_new` is V1 (phase 4), implemented here against `parse.py` and `poller.py`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+from collections.abc import Mapping
 from email.message import EmailMessage
 from typing import Any, Protocol
 from uuid import uuid4
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from app.config import Settings
-from app.domain.types import PollResult, SentMessage
+from app.domain.types import InboundMessage, PollResult, SentMessage
+from app.integrations.gmail.parse import parse_message_payload
+from app.integrations.gmail.poller import (
+    history_message_ids,
+    new_history_id,
+    search_query_fallback,
+)
 
 
 class MailClient(Protocol):
@@ -41,7 +49,14 @@ class MailClient(Protocol):
         ...
 
     async def poll_new(self, history_id: str | None) -> PollResult:
-        """V1 — not called by the MVP. Implementations in the MVP must raise."""
+        """Inbound mail since `history_id`, newest cursor included (V1, build phase 4).
+
+        `history_id` is the cursor stored from the previous poll, or `None` on the first
+        run. The returned `PollResult.history_id` is the cursor to store for next time and
+        is always present, even when no messages came back — the history window has still
+        advanced. Callers must store it; the sender allowlist, dedupe, and item mapping all
+        happen downstream, never here.
+        """
         ...
 
     async def find_sent_by_token(self, token: str) -> SentMessage | None:
@@ -69,6 +84,10 @@ AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
 # How many Sent hits to inspect before giving up. The footer token is unique per reminder,
 # so more than one hit means a duplicate send, and the first verified one is the answer.
 _SENT_SEARCH_LIMIT = 10
+
+# Page size for the 404 fallback search. The query itself is bounded (`in:inbox
+# newer_than:2d`); this only controls how many pages that bounded result takes.
+_SEARCH_PAGE_SIZE = 100
 
 
 class GmailClient:
@@ -101,14 +120,12 @@ class GmailClient:
         return await asyncio.to_thread(self._find_sent_by_token_sync, token)
 
     async def poll_new(self, history_id: str | None) -> PollResult:
-        """V1 (build phase 4) — deliberately unimplemented.
+        """Inbound mail since `history_id` (V1, build phase 4); see the port docstring.
 
-        An empty `PollResult` would read as "polled successfully, nothing new", which is a
-        silent failure; raising is the honest answer.
+        Runs the blocking History API calls on a worker thread so a poll never stalls the
+        event loop.
         """
-        raise NotImplementedError(
-            "GmailClient.poll_new is V1 (build phase 4) and is not implemented in the MVP"
-        )
+        return await asyncio.to_thread(self._poll_new_sync, history_id)
 
     # ── Internals ───────────────────────────────────────────────────────────
 
@@ -204,6 +221,115 @@ class GmailClient:
                 rfc_message_id=_header(payload, "Message-ID"),
             )
         return None
+
+    # ── Inbound poll (V1, build phase 4) ─────────────────────────────────────
+
+    def _poll_new_sync(self, history_id: str | None) -> PollResult:
+        service = self._service_or_build()
+        if history_id is None:
+            message_ids, cursor = self._fallback_sync(service)
+        else:
+            try:
+                response = self._history_response_sync(service, history_id)
+            except HttpError as exc:
+                if _status_code(exc) != 404:
+                    # Anything else is a real failure. Swallowing it would make a broken
+                    # poll look like "nothing new" — the silent-failure mode this project
+                    # exists to avoid — so it propagates.
+                    raise
+                # The stored id has aged out of Gmail's history window; the search below is
+                # bounded, and `processed_inbound_messages` makes its re-deliveries safe.
+                message_ids, cursor = self._fallback_sync(service)
+            else:
+                message_ids = history_message_ids(response)
+                # The cursor advances even when no messages came back: the history window
+                # has still moved, and keeping the old id would re-scan it forever.
+                cursor = new_history_id(response) or history_id
+
+        messages = tuple(
+            self._fetch_inbound_sync(service, message_id)
+            for message_id in dict.fromkeys(message_ids)  # history/search can repeat an id
+        )
+        return PollResult(messages=messages, history_id=cursor)
+
+    def _fallback_sync(self, service: Any) -> tuple[list[str], str | None]:
+        """The bounded-search path, plus the cursor to resume history from.
+
+        The profile is read *before* the search: a message that arrives between the two is
+        caught by the search, and one that arrives after it is caught by the next history
+        poll from this cursor.
+        """
+        cursor = self._profile_history_id_sync(service)
+        return self._search_message_ids_sync(service), cursor
+
+    def _history_response_sync(self, service: Any, history_id: str) -> Mapping[str, Any]:
+        """Every `history.list` page merged into one response dict.
+
+        Merging keeps the pagination loop out of `poller.py`: its pure helpers see the same
+        shape whether the window fit on one page or ten.
+        """
+        merged: dict[str, Any] = {"history": []}
+        page_token: str | None = None
+        while True:
+            params: dict[str, Any] = {
+                "userId": "me",
+                "startHistoryId": history_id,
+                "historyTypes": ["messageAdded"],
+            }
+            if page_token is not None:
+                params["pageToken"] = page_token
+            response = service.users().history().list(**params).execute()
+            merged["history"].extend(response.get("history") or [])
+            if response.get("historyId") is not None:
+                merged["historyId"] = response["historyId"]
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+        return merged
+
+    def _search_message_ids_sync(self, service: Any) -> list[str]:
+        """Every message id the bounded fallback query returns, across all pages."""
+        message_ids: list[str] = []
+        page_token: str | None = None
+        while True:
+            params: dict[str, Any] = {
+                "userId": "me",
+                "q": search_query_fallback(),
+                "maxResults": _SEARCH_PAGE_SIZE,
+            }
+            if page_token is not None:
+                params["pageToken"] = page_token
+            response = service.users().messages().list(**params).execute()
+            for entry in response.get("messages") or []:
+                if entry.get("id") is not None:
+                    message_ids.append(str(entry["id"]))
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+        return message_ids
+
+    def _profile_history_id_sync(self, service: Any) -> str | None:
+        """The mailbox's current `historyId`, used to seed or reset the poll cursor."""
+        profile = service.users().getProfile(userId="me").execute()
+        value = profile.get("historyId")
+        return str(value) if value is not None else None
+
+    def _fetch_inbound_sync(self, service: Any, message_id: str) -> InboundMessage:
+        message = (
+            service.users().messages().get(userId="me", id=message_id, format="full").execute()
+        )
+        return parse_message_payload(message)
+
+
+def _status_code(exc: HttpError) -> int | None:
+    """The HTTP status carried by a `googleapiclient` `HttpError`, or `None` if unreadable.
+
+    `HttpError.resp` is the `httplib2` response; its `.status` is what distinguishes an
+    expired history cursor (404) from a failure that must propagate.
+    """
+    response = getattr(exc, "resp", None)
+    status = getattr(response, "status", None)
+    return status if isinstance(status, int) else None
 
 
 def _header(payload: Any, name: str) -> str:

@@ -69,7 +69,7 @@ from app.domain.types import (
     SkipReason,
     SourceDb,
 )
-from app.integrations.gmail.compose import render_reminder
+from app.integrations.gmail.compose import reminder_subject, render_reminder
 from app.integrations.notion.normalize import normalize_page
 from app.logging import get_logger
 from app.services.alert_service import AlertService
@@ -650,8 +650,9 @@ class ReminderService:
         The question this answers is "did the email actually go out?", and Gmail answers it:
         every reminder body carries `ref: <ref_token>`, so a Sent search for that token
         settles it. Found → the row is marked `sent` with the ids Gmail returned (the email
-        exists, and the row must say so). Not found → the row goes back to `pending`
-        immediately, because no email exists.
+        exists, and the row must say so), and the conversation it belongs to is written too
+        (`_ensure_conversation`). Not found → the row goes back to `pending` immediately,
+        because no email exists.
 
         A lookup that *fails* leaves the row exactly as it is: an unreachable Gmail is not
         evidence that nothing was sent, and guessing in either direction is how a reminder
@@ -714,6 +715,10 @@ class ReminderService:
                     provider_message_id=found.provider_message_id,
                     provider_thread_id=found.provider_thread_id,
                 )
+                # The crashed send never reached `_record_sent`, so the thread mapping it
+                # would have written is missing. A recovered email is a real email and must
+                # be answerable like any other (V1, §2.3.2.E step 3).
+                await self._ensure_conversation(session, claim, found)
                 await audit_repo.append(
                     session,
                     "reminder_sent",
@@ -734,6 +739,70 @@ class ReminderService:
                 provider_message_id=found.provider_message_id,
             )
         return recovered
+
+    async def _ensure_conversation(
+        self, session: AsyncSession, claim: _Claim, sent: SentMessage
+    ) -> None:
+        """Write the thread-mapping rows a crashed send never got to write.
+
+        A recovered email is a real email: V1 maps a reply back to its item by the stored
+        Gmail `threadId`, then by `In-Reply-To`/`References` against
+        `outbound_messages.rfc_message_id` (§2.3.2.E step 3). Recovery that marked the
+        reminder `sent` without these two rows would leave every reply to that reminder
+        unmappable — audited `inbound_unmapped`, never acted on — which is exactly the gap
+        this backfill closes. What is written here mirrors `_record_sent`, in the same
+        transaction as the `mark_sent` that makes the claim true.
+
+        **Idempotent by lookup, not by an expected failure.** `email_threads.
+        provider_thread_id` and `outbound_messages.provider_message_id` are both UNIQUE, and
+        `recover_stale_claims` runs at the start of every tick, so the same email may be
+        looked at more than once (a recovery whose commit failed, a second process after a
+        deploy). The thread is therefore looked up first and the pair is written only when
+        it is absent: a repeat pass adds nothing and raises nothing, instead of relying on a
+        unique violation to make the second write fail loudly. Both rows are written
+        together or not at all, so a thread without its message cannot be produced here.
+
+        Nothing here decides whether the email was sent — `find_sent_by_token` already did —
+        and nothing here may keep the row from being `sent`: the item lookup failing is a
+        skip, not an error, because `email_threads.item_id` is NOT NULL and the reminder's
+        `sent` state is the fact that must survive.
+        """
+        if await threads_repo.get_by_provider_thread_id(session, sent.provider_thread_id):
+            return
+        item = await items_repo.get_by_id(session, claim.item_id)
+        if item is None:
+            # The item is gone (the FK cascade would normally take the reminder with it, so
+            # this is the belt-and-braces case). There is nothing to hang a conversation
+            # off, and it must not stop the sweep: the reminder still gets marked `sent`.
+            self._log.warning("stale_claim_recovered_without_item", reminder_id=str(claim.id))
+            return
+        # Recomposed, not remembered: recovery has no `NormalizedItem` in hand, and the
+        # subject must be what `_record_sent` would have stored for the same reminder.
+        subject = reminder_subject(
+            _as_normalized(item),
+            cast(ReminderType, claim.reminder_type),
+            self._container.settings.tz,
+        )
+        thread = await threads_repo.create_thread(
+            session,
+            item_id=claim.item_id,
+            reminder_id=claim.id,
+            provider_thread_id=sent.provider_thread_id,
+            subject=subject,
+            root_rfc_message_id=sent.rfc_message_id,
+        )
+        await threads_repo.add_outbound(
+            session,
+            thread_id=thread.id,
+            kind="reminder",
+            provider_message_id=sent.provider_message_id,
+            rfc_message_id=sent.rfc_message_id,
+        )
+        self._log.info(
+            "stale_claim_conversation_backfilled",
+            reminder_id=str(claim.id),
+            provider_thread_id=sent.provider_thread_id,
+        )
 
     # ── Shared bits ─────────────────────────────────────────────────────────
 

@@ -9,8 +9,9 @@ system can have — which is precisely how a closed vocabulary stops being one �
 make "show me every alert" a query against an unbounded set of names.
 
 Because of that, an unknown alert type is a `ValueError` and not a new vocabulary entry.
-`ALERT_TYPES` below is the complete MVP set; a typo fails loudly at the call site instead of
-writing a `system_alert_sent` row whose payload names an alert nobody defined.
+`ALERT_TYPES` below is the complete V1 set — every failure §2.3.4 says must reach the owner
+— and a typo fails loudly at the call site instead of writing a `system_alert_sent` row
+whose payload names an alert nobody defined.
 
 Rate limiting (FR-13: at most one per failure type per `ALERT_COOLDOWN_HOURS`) lives in
 `system_state` under `last_alert:{alert_type}` rather than in process memory: two
@@ -31,12 +32,17 @@ from app.db.repositories import state as state_repo
 from app.integrations.gmail.compose import render_system_alert
 from app.logging import get_logger
 
-# The MVP's complete alert vocabulary (§2.3.4). Deliberately a tuple, not a set: it is
-# small, it is read by a human, and its order is the order they were introduced.
+# The complete alert vocabulary (§2.3.4): every failure the owner is told about. Deliberately
+# a tuple, not a set: it is small, it is read by a human, and its order is the order they were
+# introduced.
 ALERT_TYPES: Final[tuple[str, ...]] = (
     "notion_sync_failed",  # repeated Notion sync failure — the scheduler runs on local data
     "reminder_send_failed",  # a reminder spent its whole attempt budget without sending
     "outbound_cap_exceeded",  # MAX_OUTBOUND_EMAILS_PER_HOUR tripped; sending is paused
+    "gmail_poll_failed",  # the poll job crashed, or history is gone with no fallback (FR-13)
+    "gmail_auth_failed",  # Gmail rejected our credentials — nothing will send until it is fixed
+    "deepseek_failed",  # the interpreter is failing persistently, so replies never resolve
+    "inbound_stuck",  # a message has sat `processing` past its deadline; never auto-retried
 )
 
 # `system_state` key prefix holding one alert type's last-send instant, as an ISO-8601 UTC
@@ -73,7 +79,7 @@ class AlertService:
         if alert_type not in ALERT_TYPES:
             known = ", ".join(ALERT_TYPES)
             raise ValueError(
-                f"unknown alert type {alert_type!r}; the MVP alert vocabulary is: {known}. "
+                f"unknown alert type {alert_type!r}; the alert vocabulary is: {known}. "
                 "Adding one is a §2.3.4 change, not a call-site detail."
             )
 

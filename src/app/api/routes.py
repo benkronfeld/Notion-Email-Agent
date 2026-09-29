@@ -30,6 +30,7 @@ from app.db.repositories import audit as audit_repo
 from app.db.repositories import state as state_repo
 from app.jobs import (
     JOB_FULL_RECONCILE,
+    JOB_GMAIL_POLLER,
     JOB_NOTION_SYNC,
     JOB_REMINDER_SCHEDULER,
     last_success_key,
@@ -379,6 +380,19 @@ async def trigger_scheduler_run(request: Request, container: ContainerDep) -> Jo
     if ran:
         request.app.state.last_tick_at = container.clock.now()
     return JobRunResponse(job=JOB_REMINDER_SCHEDULER, ran=ran)
+
+
+@secured.post("/admin/gmail/poll", response_model=JobRunResponse)
+async def trigger_gmail_poll(container: ContainerDep) -> JobRunResponse:
+    """Run one inbound Gmail poll now, in the request (§2.3.6).
+
+    It runs the same job body the scheduler runs — poll, then flag stuck rows — so an
+    operator-triggered poll cannot diverge from the scheduled one. The reply pipeline can
+    write to Notion, so this is not read-only: it is the one trigger that can change a
+    deadline, and it is behind the admin token for that reason.
+    """
+    ran = await run_job_once(container, JOB_GMAIL_POLLER)
+    return JobRunResponse(job=JOB_GMAIL_POLLER, ran=ran)
 
 
 # ── Manual reminder kill ────────────────────────────────────────────────────

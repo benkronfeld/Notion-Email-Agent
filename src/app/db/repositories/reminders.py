@@ -16,9 +16,9 @@ them is this file's good intentions:
 * ``UNIQUE(idempotency_key)`` — the same fact expressed a second way, so a row inserted by
   any other path cannot be duplicated either.
 * A status guard on every UPDATE: a cancel only touches `pending`/`claimed` rows, a
-  resurrection only touches a `skipped` one. An action replayed against a row that already
-  reached its target state changes nothing, which is what makes `apply_plan` return 0 the
-  second time.
+  resurrection only touches a `skipped` or `superseded` one. An action replayed against a
+  row that already reached its target state changes nothing, which is what makes
+  `apply_plan` return 0 the second time.
 
 Reads use ``populate_existing()`` because the state transitions here are Core UPDATEs: an
 entity already in the session's identity map would otherwise keep handing back its
@@ -443,16 +443,21 @@ async def _cancel(
 
 
 async def _flip_to_pending(session: AsyncSession, reminder_id: UUID, *, now: datetime) -> bool:
-    """Resurrect a skipped reminder. True only if a row changed.
+    """Resurrect a cancelled reminder — `skipped` or `superseded`. True if a row changed.
 
-    Everything the skip set is cleared, not just the status: a resurrected row must be
-    indistinguishable from a freshly inserted `pending` one, or the scheduler would claim
+    Both statuses are accepted because the planner revives both (see
+    `planner._is_revivable`): a `skipped` row when the item becomes active and incomplete
+    again, and a `superseded` row when its due date comes back. `sent` and `failed` rows
+    are still untouchable — the two terminal outcomes are not revivals.
+
+    Everything the cancellation set is cleared, not just the status: a resurrected row must
+    be indistinguishable from a freshly inserted `pending` one, or the scheduler would claim
     it carrying a stale backoff. `claimed_at` is cleared for the same reason — the row is
     not in flight yet.
     """
     result = await session.execute(
         update(Reminder)
-        .where(Reminder.id == reminder_id, Reminder.status == "skipped")
+        .where(Reminder.id == reminder_id, Reminder.status.in_(("skipped", "superseded")))
         .values(
             status="pending",
             skip_reason=None,
@@ -605,8 +610,10 @@ async def release_with_backoff(
 async def mark_superseded(session: AsyncSession, reminder_id: UUID) -> None:
     """Withdraw a row whose due date moved (FR-8 Option A).
 
-    `skip_reason` is cleared, not set: a superseded row is never revived by the planner, so
-    a reason on it would imply a meaning it does not have.
+    `skip_reason` is cleared, not set: supersession is not a skip reason. The row is not
+    simply dead, either — the planner revives it to `pending` if the due date moves back to
+    this snapshot (§2.3.2.B step 2), and `_flip_to_pending` clears the field again on the way.
+    A reason here would therefore imply a meaning that neither state has.
     """
     await session.execute(
         update(Reminder)

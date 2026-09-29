@@ -27,6 +27,7 @@ dependencies = [
     "google-api-python-client>=2.149,<3.0",
     "google-auth>=2.36,<3.0",
     "google-auth-oauthlib>=1.2,<2.0",  # only for the one-time `python -m app.cli gmail-auth`
+    "openai>=3.22.0",
 ]
 
 [dependency-groups]

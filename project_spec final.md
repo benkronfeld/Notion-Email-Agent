@@ -172,7 +172,7 @@ There is no frontend. The owner interacts through Notion and email. A small toke
 | Validation | Pydantic v2 | Config, API schemas, LLM output schema |
 | Notion | Official REST API via `notion-client` (or `httpx`) behind a `NotionClient` port | Pin `Notion-Version: 2025-09-03` or newer (data-sources model; verified against current Notion docs, see 2.3.2.A) |
 | Email | Gmail API (`google-api-python-client`, `google-auth`) | Dedicated sender Gmail account; OAuth scopes `gmail.send` + `gmail.readonly` |
-| AI model | DeepSeek V4.1 Flash, model name `deepseek-flash`, official DeepSeek API via OpenAI-compatible client (`openai` SDK with configurable `base_url`) | Temperature 0; `response_format={"type": "json_object"}` (generic JSON mode only — no JSON-schema structured output on this API, verified against DeepSeek's docs); thinking disabled via `extra_body={"thinking": {"type": "disabled"}}` (thinking defaults to ON at `high` effort otherwise); model and base URL are env config |
+| AI model | DeepSeek V4.1 Flash, model name `deepseek-flash`, official DeepSeek API via OpenAI-compatible client (`openai` SDK with configurable `base_url`) | `openai` is pinned as `>=3.22.0` (added in V1; the SDK bundles its own transport, `httpx2`, alongside the repo's pinned `httpx`). It raises on an empty API key at client construction, so `DeepSeekInterpreter` builds its client **lazily on first use** and construction never fails on config. Temperature 0; `response_format={"type": "json_object"}` (generic JSON mode only — no JSON-schema structured output on this API, verified against DeepSeek's docs); thinking disabled via `extra_body={"thinking": {"type": "disabled"}}` (thinking defaults to ON at `high` effort otherwise); model and base URL are env config |
 | HTTP resilience | `tenacity` (retry, exponential backoff, jitter) | Respects Notion/Gmail rate limits (Notion averages about 3 req/s) |
 | Time | stdlib `zoneinfo` | Injected `Clock` for testability |
 | Logging | `structlog` (JSON to stdout) | Correlation IDs per job run and per inbound message |
@@ -275,9 +275,12 @@ desired = targets(item.item_kind, desired_due) if not is_complete and desired_du
                                            or skipped(item_completed / item_inactive)
 2. For each desired (type, target_at):
      row exists for (item, type, due_at_snapshot)?
-        - status skipped AND skip_reason IN (item_completed, item_inactive) AND target_at > now AND item active
-          AND not is_complete  -> flip to pending   # symmetric with step 1: un-completing an item and
-                                                     # un-archiving/un-deleting it both resurrect a still-future reminder
+        - status IN (skipped(item_completed | item_inactive), superseded)
+          AND target_at > now AND item active AND not is_complete
+                             -> flip to pending   # symmetric with step 1: un-completing an item and
+                                                  # un-archiving/un-deleting it both resurrect a
+                                                  # still-future reminder, and a `superseded` row is
+                                                  # revived when its date comes back (see below)
         - otherwise leave as is (sent stays sent; never duplicate)
      no row?
         - target_at > now  -> insert pending
@@ -286,7 +289,7 @@ desired = targets(item.item_kind, desired_due) if not is_complete and desired_du
 
 The unique constraint `(item_id, reminder_type, due_at_snapshot)` plus the idempotency key make this safe to run any number of times. Option A follows naturally: a new `due_at_snapshot` is a new key.
 
-> **Known gap, implemented as written.** Step 2 revives a `skipped` row but says nothing about a `superseded` one. So if a due date moves away and then back, the original rows still occupy the unique key and stay `superseded` — the restored date receives **no** reminder. That is a silently lost reminder, the outcome `CLAUDE.md` constraint 7 exists to prevent, and it is the one place this algorithm reads oddly. It is left as specified rather than quietly changed, and pinned by a test in `tests/unit/test_planner.py` so that reversing the decision is deliberate. Tracked under "Carried into V1" in [`Project_status.md`](Project_status.md).
+> **The reverted-due-date gap, closed in V1.** Step 2 originally revived a `skipped` row but said nothing about a `superseded` one. So if a due date moves away and then back, the original rows still occupy the unique key and stay `superseded` — the restored date receives **no** reminder. That is a silently lost reminder, the outcome `CLAUDE.md` constraint 7 exists to prevent, and it is the one place this algorithm reads oddly. V1 closed it rather than leaving it as written: step 2 now revives a `superseded` row whose `due_at_snapshot` equals the desired due date, under the same guards as a revived skip (`target_at > now`, the item active, the item not complete), and `_flip_to_pending` accepts a `superseded` row. A `sent` row is still never revived, so sent history and old schedules stay distinct, and a `missed_window` skip is still never revived because that window is gone for good (FR-4). `tests/unit/test_planner.py` pins both the revival and the round trip (date A to date B and back).
 
 **C. Reminder scheduler (every 5 min, local DB only)**
 
@@ -313,7 +316,7 @@ loop:
 ```
 
 - **Send backoff** (the pseudocode above says only "with backoff"; decided at implementation): `next_attempt_at = now + min(30s · 2^(attempt−1), 10min)` with ±20% jitter, giving roughly 30s / 60s / 120s / 240s. The base is **30 seconds, not 60**, because `attempt_count` is incremented on *claim* — so a failure that is still retrying consumes clock time the moment it is claimed. At a 60-second base the fifth and final attempt would not be reached until about +15 minutes, breaching the MVP criterion that a reminder goes out within about 5 minutes of its target; 30 seconds reaches it at about +7.5 minutes.
-- **Stale-claim recovery** (a crash between claim and send/mark): rows `claimed` for more than 10 minutes are checked against Gmail Sent by the reminder's `ref_token` (an alphanumeric token in the email footer). If found, mark `sent`; if not, return to `pending`. This makes duplicate sends very unlikely; a duplicate is preferred over a silently lost reminder.
+- **Stale-claim recovery** (a crash between claim and send/mark): rows `claimed` for more than 10 minutes are checked against Gmail Sent by the reminder's `ref_token` (an alphanumeric token in the email footer). If found, mark `sent` **and write the `email_threads` / `outbound_messages` rows from the ids Gmail returns**, using the same subject the original send would have used; if not, return to `pending`. The backfill is not optional bookkeeping: recovery is how a crashed send is confirmed, and without those rows the reminder would exist in the owner's inbox with no thread mapping, so a reply to it would fail to resolve and be audited `inbound_unmapped` (§2.3.2.E step 3). Recovery is idempotent — it runs at the start of every scheduler tick, and a second pass over an already-linked reminder must neither raise nor duplicate. This makes duplicate sends very unlikely; a duplicate is preferred over a silently lost reminder.
 - Only one scheduler instance runs jobs at a time (Postgres advisory lock), so overlapping deploys cannot double-process.
 
 **D. Outbound email**
@@ -383,6 +386,9 @@ notion-email-agent/
 ├── .github/workflows/ci.yml        # lint, type-check, tests vs a Postgres service container
 ├── src/app/
 │   ├── main.py                     # FastAPI app, lifespan starts scheduler
+│   ├── asgi.py                     # uvicorn entrypoint (app.asgi:app); the ONLY module
+│   │                               # that reads the environment at import time
+│   ├── bootstrap.py                # build_container(settings): the real adapter set
 │   ├── config.py                   # Pydantic Settings
 │   ├── clock.py                    # Clock port + SystemClock
 │   ├── logging.py
@@ -494,6 +500,20 @@ Payload shapes below are verified against Notion's current `PATCH /v1/pages/{pag
 **ReminderService, InboundService, SyncService, AlertService, AuditLog**
 
 As described in 2.3.2. `AlertService` emails the owner on: repeated sync failure, send failures after max attempts, Gmail auth failure, DeepSeek outage, stuck `processing` rows, outbound cap hit. It is rate-limited per failure type via `system_state`.
+
+`AlertService`'s alert vocabulary is **closed** — an unknown type raises `ValueError` rather than writing a `system_alert_sent` row naming a failure nobody defined. The implemented set is exactly:
+
+| `alert_type` | Raised when |
+|---|---|
+| `notion_sync_failed` | A sync or full-reconcile job fails repeatedly; the scheduler keeps running on local data |
+| `reminder_send_failed` | A reminder spent its whole attempt budget without sending |
+| `outbound_cap_exceeded` | `MAX_OUTBOUND_EMAILS_PER_HOUR` tripped; sending is paused |
+| `gmail_poll_failed` | The Gmail poll job crashed, or the poll errored (history gone with no usable fallback) |
+| `gmail_auth_failed` | Gmail rejected our credentials; nothing will send until it is fixed |
+| `deepseek_failed` | The interpreter is failing persistently, so replies never resolve |
+| `inbound_stuck` | A `processed_inbound_messages` row has sat `processing` past its deadline |
+
+Adding one is a change to this table, not a call-site detail.
 
 **Email templates (plain text)**
 
@@ -628,7 +648,9 @@ CREATE TABLE courses (
 );
 ```
 
-**Audit `event_type` values:** `notion_sync`, `notion_full_reconcile`, `item_deactivated`, `type_mismatch`, `reminder_created`, `reminder_sent`, `reminder_skipped`, `reminder_superseded`, `reminder_failed`, `presend_check_skipped`, `inbound_email_received`, `inbound_ignored`, `inbound_unmapped`, `reply_interpreted`, `clarification_requested`, `notion_update_attempted`, `notion_update_succeeded`, `notion_update_failed`, `system_alert_sent`.
+**Audit `event_type` values:** `notion_sync`, `notion_full_reconcile`, `item_deactivated`, `type_mismatch`, `reminder_created`, `reminder_sent`, `reminder_skipped`, `reminder_superseded`, `reminder_failed`, `presend_check_skipped`, `inbound_email_received`, `inbound_ignored`, `inbound_unmapped`, `reply_interpreted`, `clarification_requested`, `notion_update_attempted`, `notion_update_succeeded`, `notion_update_failed`, `inbound_stuck`, `system_alert_sent`.
+
+`inbound_stuck` was added in V1. §2.3.2.E requires that a `processed_inbound_messages` row left `processing` past its deadline be "flagged in the audit log and alerts the owner" but did not name an event, and this vocabulary is closed — so the name is recorded here rather than invented at the call site.
 
 The audit log is append-only by convention (the app never issues UPDATE or DELETE against it). Optionally enforce it with a trigger.
 
