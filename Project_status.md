@@ -65,7 +65,14 @@ Two milestones, defined by the success criteria in spec §1.2 and delivered by t
   producing a question and no write, and a duplicate processed once.
 
 **Not verified:** any live Notion, Gmail, or DeepSeek call — by design (CLAUDE.md
-constraint 5). `.github/workflows/ci.yml` has still never run.
+constraint 5).
+
+**Verified in CI.** `.github/workflows/ci.yml` runs the whole suite on every push and pull
+request, against a PostgreSQL 16 service container on `ubuntu-latest`, after `uv sync
+--frozen`, ruff check, `ruff format --check`, mypy, and `alembic upgrade head`. The merged V1
+tree passes it (`525c35a`, 58s). That is worth more than it sounds: it is a *different*
+environment from the local Windows run — Linux, a fresh database, a frozen lockfile — so it
+independently confirms the suite is not passing by accident of this machine.
 
 ## What's next
 

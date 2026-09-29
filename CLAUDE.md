@@ -96,8 +96,10 @@ uv run python -m app.cli gmail-auth       # one-time Google OAuth; prints a refr
 Everything except `/healthz` needs `Authorization: Bearer $ADMIN_API_TOKEN`.
 
 Tests are split by kind — `tests/unit`, `tests/contract`, `tests/integration`, `tests/e2e`;
-see **Layout** under Architecture. `.github/workflows/ci.yml` exists but has never run, so
-treat it as unverified configuration.
+see **Layout** under Architecture. `.github/workflows/ci.yml` runs on push and pull request
+(it is verified, not aspirational): `uv sync --frozen`, ruff check, `ruff format --check`,
+mypy, `alembic upgrade head`, then `pytest`, against a PostgreSQL 16 service container on
+`ubuntu-latest`. Check `gh run list` before claiming a green build.
 
 If a run and another test run must not truncate each other's rows, point one at its own
 database with `TEST_DATABASE_URL`. The integration harness creates and migrates whatever

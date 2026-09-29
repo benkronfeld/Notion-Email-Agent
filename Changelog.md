@@ -28,9 +28,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) in spiri
 - **Stale-claim recovery wrote no thread-mapping rows.** It marked a reminder `sent` after a crash without creating `email_threads`/`outbound_messages`, so a reply to a recovered reminder would have found no mapping and been audited `inbound_unmapped`. Recovery now writes both rows from the ids Gmail returns, idempotently, so a second pass neither raises nor duplicates.
 - **`email_threads.provider_thread_id` was `UNIQUE` in migration `0001` but not in the model**, so the model and the schema disagreed. Declared on the model for parity.
 - **Two docstrings in `src/app/db/repositories/reminders.py` stated things the reverted-due-date fix had made false** — that a resurrection "only touches a `skipped` one", and that "a superseded row is never revived by the planner". The behaviour they described (`skip_reason = None` on supersession) is unchanged and still correct; the reasoning given for it was not. Comments only.
+- **`CLAUDE.md` and `Project_status.md` claimed `.github/workflows/ci.yml` had never run.** It has, on every push and pull request since 2026-09-28, and the claim was wrong when it was written — the repository has had a remote the whole time. Both now describe what CI actually does and point at `gh run list`. This supersedes the same claim in the 2026-09-28 entry below.
 
 #### Changed
 
+- **V1 merged to `main` and pushed** (`525c35a`, a `--no-ff` merge of `feat/v1`). The merged tree is byte-identical to the verified `feat/v1` tip, and CI passed on it in 58s — the first time the full suite has run on Linux against a fresh PostgreSQL 16 in a clean checkout, which is independent of the local Windows run.
 - `src/app/domain/types.py` — the V1 placeholders are replaced by the real shapes: `InboundMessage` (what the mail adapter hands back), a typed `PollResult`, and an expanded `InterpretationContext`. `Intent` moved to `domain/intents.py` as a Pydantic model.
 - `src/app/services/alert_service.py` — `ALERT_TYPES` grows from three to seven, matching the failures §2.3.4 names.
 - `src/app/jobs.py` — the module docstring's claim that there is "deliberately no Gmail poll job" is no longer true; the poller is registered on `GMAIL_POLL_INTERVAL_SEC` and its failures alert `gmail_poll_failed`.
